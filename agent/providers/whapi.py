@@ -29,21 +29,57 @@ class ProveedorWhapi(ProveedorWhatsApp):
             ))
         return mensajes
 
-    async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
-        """Envía mensaje via Whapi.cloud."""
-        if not self.token:
-            logger.warning("WHAPI_TOKEN no configurado — mensaje no enviado")
-            return False
-        headers = {
+    def _headers(self) -> dict:
+        return {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
+
+    async def enviar_mensaje(self, telefono: str, mensaje: str) -> bool:
+        """Envía mensaje de texto via Whapi.cloud."""
+        if not self.token:
+            logger.warning("WHAPI_TOKEN no configurado — mensaje no enviado")
+            return False
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 self.url_envio,
                 json={"to": telefono, "body": mensaje},
-                headers=headers,
+                headers=self._headers(),
             )
             if r.status_code != 200:
-                logger.error(f"Error Whapi: {r.status_code} — {r.text}")
+                logger.error(f"Error Whapi texto: {r.status_code} — {r.text}")
+            return r.status_code == 200
+
+    async def enviar_documento(self, telefono: str, url: str, nombre: str, caption: str = "") -> bool:
+        """Envía un documento (PDF) via Whapi.cloud usando URL pública."""
+        if not self.token:
+            return False
+        payload = {"to": telefono, "media": url, "filename": nombre}
+        if caption:
+            payload["caption"] = caption
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://gate.whapi.cloud/messages/document",
+                json=payload,
+                headers=self._headers(),
+            )
+            if r.status_code != 200:
+                logger.error(f"Error Whapi documento: {r.status_code} — {r.text}")
+            return r.status_code == 200
+
+    async def enviar_imagen(self, telefono: str, url: str, caption: str = "") -> bool:
+        """Envía una imagen via Whapi.cloud usando URL pública."""
+        if not self.token:
+            return False
+        payload = {"to": telefono, "media": url}
+        if caption:
+            payload["caption"] = caption
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://gate.whapi.cloud/messages/image",
+                json=payload,
+                headers=self._headers(),
+            )
+            if r.status_code != 200:
+                logger.error(f"Error Whapi imagen: {r.status_code} — {r.text}")
             return r.status_code == 200

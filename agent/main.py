@@ -1,10 +1,12 @@
 # agent/main.py — Servidor FastAPI + Webhook + Scheduler de seguimientos
 
 import os
+import re
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -14,7 +16,10 @@ from agent.memory import (
     registrar_o_actualizar_lead, obtener_leads_para_seguimiento, incrementar_seguimiento,
 )
 from agent.providers import obtener_proveedor
-from agent.tools import calificar_interes, estado_desde_interes, obtener_mensaje_seguimiento
+from agent.tools import (
+    calificar_interes, estado_desde_interes, obtener_mensaje_seguimiento,
+    CATALOGO_ARCHIVOS, obtener_url_archivo,
+)
 
 load_dotenv()
 
@@ -26,15 +31,48 @@ logger = logging.getLogger("agentkit")
 proveedor = obtener_proveedor()
 PORT = int(os.getenv("PORT", 8000))
 FOLLOWUP_DIAS = int(os.getenv("FOLLOWUP_DIAS", 3))
+BASE_URL = os.getenv("BASE_URL", f"http://localhost:{PORT}")
 
 scheduler = AsyncIOScheduler()
 
+# Regex para detectar etiquetas de archivo en la respuesta del agente
+REGEX_ARCHIVO = re.compile(r"\[ARCHIVO:(\w+)\]")
+
+
+def extraer_archivos(texto: str) -> tuple[str, list[str]]:
+    """
+    Extrae las etiquetas [ARCHIVO:xxx] del texto y las retorna por separado.
+    Retorna (texto_limpio, lista_de_claves).
+    """
+    claves = REGEX_ARCHIVO.findall(texto)
+    texto_limpio = REGEX_ARCHIVO.sub("", texto).strip()
+    return texto_limpio, claves
+
+
+async def enviar_archivos(telefono: str, claves: list[str]):
+    """Envía los archivos correspondientes a las claves detectadas."""
+    for clave in claves:
+        archivo = CATALOGO_ARCHIVOS.get(clave)
+        if not archivo:
+            logger.warning(f"Clave de archivo no encontrada en catálogo: {clave}")
+            continue
+
+        if archivo["tipo"] == "documento":
+            url = obtener_url_archivo(archivo["ruta_media"], BASE_URL)
+            ok = await proveedor.enviar_documento(
+                telefono, url, archivo["nombre"], archivo.get("caption", "")
+            )
+            logger.info(f"Documento '{clave}' enviado a {telefono}: {ok}")
+
+        elif archivo["tipo"] == "imagenes":
+            for img in archivo["archivos"]:
+                url = obtener_url_archivo(img["ruta_media"], BASE_URL)
+                ok = await proveedor.enviar_imagen(telefono, url, img.get("caption", ""))
+                logger.info(f"Imagen '{img['ruta_media']}' enviada a {telefono}: {ok}")
+
 
 async def enviar_seguimientos_programados():
-    """
-    Tarea automática: busca leads sin contacto reciente y les envía un mensaje de seguimiento.
-    Se ejecuta cada 24 horas.
-    """
+    """Tarea automática: envía seguimientos a leads sin contacto reciente."""
     logger.info("Ejecutando seguimientos automáticos...")
     leads = await obtener_leads_para_seguimiento(dias_sin_contacto=FOLLOWUP_DIAS)
 
@@ -51,8 +89,6 @@ async def enviar_seguimientos_programados():
                 await incrementar_seguimiento(lead.telefono)
                 await guardar_mensaje(lead.telefono, "assistant", mensaje)
                 logger.info(f"Seguimiento enviado a {lead.telefono} (#{lead.seguimientos_enviados + 1})")
-            else:
-                logger.warning(f"No se pudo enviar seguimiento a {lead.telefono}")
 
         except Exception as e:
             logger.error(f"Error enviando seguimiento a {lead.telefono}: {e}")
@@ -60,11 +96,9 @@ async def enviar_seguimientos_programados():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Inicializa la base de datos y el scheduler al arrancar."""
     await inicializar_db()
     logger.info("Base de datos inicializada")
 
-    # Scheduler de seguimientos: corre cada 24 horas
     scheduler.add_job(
         enviar_seguimientos_programados,
         trigger="interval",
@@ -73,12 +107,10 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    logger.info(f"Scheduler iniciado — seguimientos cada 24h (leads sin contacto >{FOLLOWUP_DIAS} días)")
-    logger.info(f"Servidor AgentKit corriendo en puerto {PORT}")
-    logger.info(f"Proveedor de WhatsApp: {proveedor.__class__.__name__}")
+    logger.info(f"Scheduler iniciado — seguimientos cada 24h")
+    logger.info(f"Servidor corriendo en puerto {PORT} | BASE_URL: {BASE_URL}")
 
     yield
-
     scheduler.shutdown()
 
 
@@ -88,6 +120,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Servir archivos de media públicamente
+if os.path.exists("media"):
+    app.mount("/media", StaticFiles(directory="media"), name="media")
+
 
 @app.get("/")
 async def health_check():
@@ -96,7 +132,6 @@ async def health_check():
 
 @app.get("/webhook")
 async def webhook_verificacion(request: Request):
-    """Verificación GET del webhook (requerido por Meta, no-op para Whapi)."""
     resultado = await proveedor.validar_webhook(request)
     if resultado is not None:
         return PlainTextResponse(str(resultado))
@@ -106,8 +141,8 @@ async def webhook_verificacion(request: Request):
 @app.post("/webhook")
 async def webhook_handler(request: Request):
     """
-    Recibe mensajes de WhatsApp, genera respuesta con IA y la envía de vuelta.
-    También registra y califica el lead automáticamente.
+    Recibe mensajes de WhatsApp, genera respuesta con IA y la envía.
+    Si la respuesta incluye [ARCHIVO:xxx], envía el archivo correspondiente.
     """
     try:
         mensajes = await proveedor.parsear_webhook(request)
@@ -118,27 +153,29 @@ async def webhook_handler(request: Request):
 
             logger.info(f"Mensaje de {msg.telefono}: {msg.texto[:80]}")
 
-            # Obtener historial antes de guardar (evita duplicados en el contexto)
             historial = await obtener_historial(msg.telefono)
+            respuesta_cruda = await generar_respuesta(msg.texto, historial)
 
-            # Generar respuesta con IA
-            respuesta = await generar_respuesta(msg.texto, historial)
+            # Extraer etiquetas de archivo y limpiar el texto
+            respuesta_texto, archivos_a_enviar = extraer_archivos(respuesta_cruda)
 
             # Guardar conversación
             await guardar_mensaje(msg.telefono, "user", msg.texto)
-            await guardar_mensaje(msg.telefono, "assistant", respuesta)
+            await guardar_mensaje(msg.telefono, "assistant", respuesta_texto)
 
-            # Registrar/actualizar lead con su nivel de interés
+            # Registrar/actualizar lead
             interes = calificar_interes(msg.texto)
             estado = estado_desde_interes(interes)
-            await registrar_o_actualizar_lead(
-                telefono=msg.telefono,
-                estado=estado,
-            )
+            await registrar_o_actualizar_lead(telefono=msg.telefono, estado=estado)
 
-            # Enviar respuesta por WhatsApp
-            await proveedor.enviar_mensaje(msg.telefono, respuesta)
-            logger.info(f"Respuesta enviada a {msg.telefono} | interés: {interes}")
+            # Enviar respuesta de texto
+            await proveedor.enviar_mensaje(msg.telefono, respuesta_texto)
+
+            # Enviar archivos si el agente los solicitó
+            if archivos_a_enviar:
+                await enviar_archivos(msg.telefono, archivos_a_enviar)
+
+            logger.info(f"Respuesta enviada a {msg.telefono} | interés: {interes} | archivos: {archivos_a_enviar}")
 
         return {"status": "ok"}
 

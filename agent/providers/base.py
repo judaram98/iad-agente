@@ -30,3 +30,11 @@ class ProveedorWhatsApp(ABC):
     async def validar_webhook(self, request: Request) -> dict | int | None:
         """Verificación GET del webhook (solo Meta la requiere). Retorna respuesta o None."""
         return None
+
+    async def enviar_documento(self, telefono: str, url: str, nombre: str, caption: str = "") -> bool:
+        """Envía un documento (PDF, etc.) por URL pública."""
+        return False
+
+    async def enviar_imagen(self, telefono: str, url: str, caption: str = "") -> bool:
+        """Envía una imagen por URL pública."""
+        return False

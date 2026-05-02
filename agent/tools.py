@@ -5,6 +5,45 @@ from datetime import datetime
 
 logger = logging.getLogger("agentkit")
 
+# ── Catálogo de archivos compartibles ────────────────────────────────────────
+
+CATALOGO_ARCHIVOS = {
+    "brochure": {
+        "nombre": "Brochure Acuario Vallarta.pdf",
+        "ruta_media": "brochure.pdf",
+        "tipo": "documento",
+        "caption": "📋 Brochure oficial del Acuario Vallarta — IAD México",
+    },
+    "comparativo": {
+        "nombre": "Comparativo de Inversión.pdf",
+        "ruta_media": "comparativo.pdf",
+        "tipo": "documento",
+        "caption": "📊 Comparativo: Acuario Vallarta vs Inversión Inmobiliaria Tradicional",
+    },
+    "requisitos": {
+        "nombre": "Requisitos para Invertir.pdf",
+        "ruta_media": "requisitos.pdf",
+        "tipo": "documento",
+        "caption": "✅ Requisitos para convertirte en accionista del Acuario Vallarta",
+    },
+    "imagenes": {
+        "tipo": "imagenes",
+        "archivos": [
+            {"ruta_media": "imagen1.jpg", "caption": "🏗️ Acuario Vallarta — Vista del proyecto (1/5)"},
+            {"ruta_media": "imagen2.jpg", "caption": "🐧 Acuario Vallarta — Pingüinario (2/5)"},
+            {"ruta_media": "imagen3.jpg", "caption": "🌊 Acuario Vallarta — Experiencias inmersivas (3/5)"},
+            {"ruta_media": "imagen4.jpg", "caption": "📍 Acuario Vallarta — Plaza La Isla (4/5)"},
+            {"ruta_media": "imagen5.jpg", "caption": "✨ Acuario Vallarta — Avance de obra (5/5)"},
+        ],
+    },
+}
+
+
+def obtener_url_archivo(ruta_media: str, base_url: str) -> str:
+    """Construye la URL pública de un archivo en /media."""
+    return f"{base_url.rstrip('/')}/media/{ruta_media}"
+
+
 # ── Información del proyecto ──────────────────────────────────────────────────
 
 INFO_PROYECTO = {
