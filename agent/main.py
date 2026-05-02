@@ -58,16 +58,16 @@ async def enviar_archivos(telefono: str, claves: list[str]):
             continue
 
         if archivo["tipo"] == "documento":
-            url = obtener_url_archivo(archivo["ruta_media"], BASE_URL)
+            ruta = f"media/{archivo['ruta_media']}"
             ok = await proveedor.enviar_documento(
-                telefono, url, archivo["nombre"], archivo.get("caption", "")
+                telefono, ruta, archivo["nombre"], archivo.get("caption", "")
             )
             logger.info(f"Documento '{clave}' enviado a {telefono}: {ok}")
 
         elif archivo["tipo"] == "imagenes":
             for img in archivo["archivos"]:
-                url = obtener_url_archivo(img["ruta_media"], BASE_URL)
-                ok = await proveedor.enviar_imagen(telefono, url, img.get("caption", ""))
+                ruta = f"media/{img['ruta_media']}"
+                ok = await proveedor.enviar_imagen(telefono, ruta, img.get("caption", ""))
                 logger.info(f"Imagen '{img['ruta_media']}' enviada a {telefono}: {ok}")
 
 
