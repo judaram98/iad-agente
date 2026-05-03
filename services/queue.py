@@ -79,26 +79,25 @@ async def _procesar(item: dict) -> None:
     lag_ms = round((time.monotonic() - item["enqueued_at"]) * 1000)
 
     if tipo == "kommo_chat":
-        msg = payload.get("message", {})
-        logger.info(
-            "[QUEUE] kommo_chat | "
-            f"lead={msg.get('entity_id')} "
-            f"tipo={msg.get('type')} "
-            f"origen={msg.get('origin', 'desconocido')} "
-            f"texto='{str(msg.get('text', ''))[:80]}' "
-            f"lag={lag_ms}ms"
-        )
+        for msg in payload.get("messages", []):
+            logger.info(
+                "[QUEUE] kommo_chat | "
+                f"lead={msg.get('entity_id')} "
+                f"tipo={msg.get('type')} "
+                f"autor='{msg.get('author_name', '')}' "
+                f"texto='{msg.get('text', '')[:80]}' "
+                f"lag={lag_ms}ms"
+            )
 
     elif tipo == "kommo_lead":
-        leads = payload.get("leads", {})
-        creados  = len(leads.get("add", []))
-        actualizados = len(leads.get("update", []) + leads.get("status", []))
-        logger.info(
-            "[QUEUE] kommo_lead | "
-            f"account={payload.get('account_id')} "
-            f"creados={creados} actualizados={actualizados} "
-            f"lag={lag_ms}ms"
-        )
+        for ev in payload.get("leads", []):
+            logger.info(
+                "[QUEUE] kommo_lead | "
+                f"lead={ev.get('id')} "
+                f"pipeline={ev.get('pipeline_id')} "
+                f"{ev.get('old_status_id')} → {ev.get('status_id')} "
+                f"lag={lag_ms}ms"
+            )
 
     else:
         logger.warning(f"[QUEUE] tipo desconocido={tipo} | {item}")
