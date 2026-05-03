@@ -4,7 +4,9 @@
 #   AGENT_MODE=whapi  → generar_respuesta()         (clave: teléfono)
 #   AGENT_MODE=kommo  → procesar_mensaje_kommo()    (clave: lead_id)
 
+import json
 import os
+import re
 import yaml
 import logging
 from groq import AsyncGroq
@@ -18,7 +20,6 @@ MODELO = "llama-3.3-70b-versatile"
 
 
 def cargar_config_prompts() -> dict:
-    """Lee toda la configuración desde config/prompts.yaml."""
     try:
         with open("config/prompts.yaml", "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
@@ -27,9 +28,39 @@ def cargar_config_prompts() -> dict:
         return {}
 
 
+def _cargar_business() -> dict:
+    try:
+        with open("config/business.yaml", "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+
 def cargar_system_prompt() -> str:
-    config = cargar_config_prompts()
-    return config.get("system_prompt", "Eres un asesor de inversiones útil. Responde en español.")
+    """
+    Carga el system prompt de prompts.yaml y sustituye los placeholders
+    estáticos [NOMBRE_INMOBILIARIA] y [CIUDAD/ZONA] desde business.yaml.
+    El placeholder {{contexto_del_lead}} NO se sustituye aquí — se inyecta
+    en tiempo de ejecución dentro de procesar_mensaje_kommo/generar_respuesta.
+    """
+    cfg = cargar_config_prompts()
+    biz = _cargar_business()
+
+    base = cfg.get("system_prompt", "Eres una asesora inmobiliaria. Responde en español.")
+    tools_ctx = cfg.get("tools_instrucciones", "")
+
+    # Sustituir variables de negocio
+    tvars = biz.get("template_vars", {})
+    nombre_inmo = tvars.get("nombre_inmobiliaria") or biz.get("negocio", {}).get("nombre", "la inmobiliaria")
+    ciudad = tvars.get("ciudad", "la zona")
+
+    base = base.replace("[NOMBRE_INMOBILIARIA]", nombre_inmo)
+    base = base.replace("[CIUDAD/ZONA]", ciudad)
+
+    if tools_ctx:
+        base = f"{base}\n\n{tools_ctx}"
+
+    return base
 
 
 def obtener_mensaje_error() -> str:
@@ -42,38 +73,165 @@ def obtener_mensaje_fallback() -> str:
     return config.get("fallback_message", "Disculpa, no entendí tu mensaje. ¿Podrías reformularlo?")
 
 
-def construir_contexto_lead(lead_data: dict) -> str:
+_MAX_TOOL_CALLS = 5
+
+
+async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
     """
-    Convierte los datos del lead de Kommo en un bloque de contexto
-    que se inyecta al inicio del system prompt.
+    Ciclo de tool calling con Groq (OpenAI-compatible).
+
+    Pasa TOOLS al modelo y maneja la secuencia:
+      modelo decide llamar tool → ejecutar → devolver resultado → modelo continúa.
+    Limita a _MAX_TOOL_CALLS iteraciones para evitar loops infinitos de LLaMA.
+    """
+    from agent.tools import TOOLS, ejecutar_tool
+
+    tool_calls_total = 0
+
+    while True:
+        # Ofrecer tools solo si no se ha alcanzado el límite
+        usar_tools = tool_calls_total < _MAX_TOOL_CALLS
+        kwargs: dict = {
+            "model": MODELO,
+            "messages": mensajes,
+            "max_tokens": 1024,
+            "temperature": 0.7,
+        }
+        if usar_tools:
+            kwargs["tools"] = TOOLS
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            logger.error(f"[BRAIN] Error Groq API: {e}")
+            return obtener_mensaje_error()
+
+        choice = response.choices[0]
+        tool_calls = getattr(choice.message, "tool_calls", None)
+
+        # Sin tool calls → retornar texto final
+        if choice.finish_reason != "tool_calls" or not tool_calls:
+            return choice.message.content or obtener_mensaje_error()
+
+        # Si ya alcanzamos el límite y el modelo aún quiere llamar tools,
+        # hacer una última llamada sin tools para forzar respuesta de texto.
+        if not usar_tools:
+            logger.warning(f"[BRAIN] Límite de {_MAX_TOOL_CALLS} tool calls alcanzado — forzando respuesta")
+            try:
+                final = await client.chat.completions.create(
+                    model=MODELO, messages=mensajes, max_tokens=1024, temperature=0.7,
+                )
+                return final.choices[0].message.content or obtener_mensaje_error()
+            except Exception as e:
+                logger.error(f"[BRAIN] Error en llamada final sin tools: {e}")
+                return obtener_mensaje_error()
+
+        # Agregar mensaje del asistente (con sus tool calls) al historial
+        mensajes.append({
+            "role": "assistant",
+            "content": choice.message.content,  # puede ser None — OK para OpenAI/Groq
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        # Ejecutar cada tool call y agregar el resultado
+        for tc in tool_calls:
+            tool_calls_total += 1
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+
+            logger.info(f"[BRAIN] Tool call #{tool_calls_total}: {tc.function.name}({list(args.keys())})")
+            result_str = await ejecutar_tool(tc.function.name, args, lead_id)
+            logger.debug(f"[BRAIN] Tool result: {result_str[:200]}")
+
+            mensajes.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result_str,
+            })
+
+
+_RE_DATO_TAG = re.compile(r"^dato_(\w+):(.+)$")
+
+
+def construir_contexto_lead(
+    lead_data: dict,
+    historial: list[dict] | None = None,
+) -> str:
+    """
+    Construye el bloque {{contexto_del_lead}} que se inyecta en el system prompt.
+
+    Incluye:
+    - Etapa actual humanizada (no el ID numérico)
+    - Datos calificadores ya registrados (campos personalizados + tags dato_*)
+    - Resumen de los últimos 5 mensajes del historial
     """
     from config.etapas import NOMBRE_ETAPA
-    status_id = lead_data.get("status_id", 0)
-    etapa_nombre = NOMBRE_ETAPA.get(status_id, f"Etapa desconocida ({status_id})")
 
-    nombre = lead_data.get("name", "Sin nombre")
+    # ── Etapa humanizada ─────────────────────────────────────────────────────
+    status_id = lead_data.get("status_id", 0)
+    etapa = NOMBRE_ETAPA.get(status_id, f"Desconocida (id={status_id})")
+    nombre = lead_data.get("name") or "Sin nombre"
     lead_id = lead_data.get("id", "?")
 
-    tags = [t.get("name", "") for t in lead_data.get("_embedded", {}).get("tags", [])]
-    tags_str = ", ".join(tags) if tags else "ninguna"
+    # ── Datos calificadores ──────────────────────────────────────────────────
+    datos: dict[str, str] = {}
 
-    campos = lead_data.get("custom_fields_values") or []
-    campos_str = ""
-    for campo in campos:
+    # Desde custom_fields_values (si KOMMO_FIELD_* está configurado)
+    for campo in (lead_data.get("custom_fields_values") or []):
         nombre_campo = campo.get("field_name", "")
-        valores = [str(v.get("value", "")) for v in campo.get("values", [])]
+        valores = [str(v.get("value", "")) for v in campo.get("values", []) if v.get("value") is not None]
         if nombre_campo and valores:
-            campos_str += f"\n  - {nombre_campo}: {', '.join(valores)}"
+            datos[nombre_campo] = ", ".join(valores)
 
-    return (
-        f"## Contexto del lead actual\n"
-        f"- Lead ID: {lead_id}\n"
-        f"- Nombre: {nombre}\n"
-        f"- Etapa actual: {etapa_nombre}\n"
-        f"- Etiquetas: {tags_str}"
-        + (f"\n- Campos personalizados:{campos_str}" if campos_str else "")
-        + "\n"
-    )
+    # Desde tags con formato dato_campo:valor (fallback cuando no hay field_id)
+    tags_raw = [t.get("name", "") for t in lead_data.get("_embedded", {}).get("tags", [])]
+    for tag in tags_raw:
+        m = _RE_DATO_TAG.match(tag)
+        if m:
+            datos.setdefault(m.group(1), m.group(2))  # custom_field tiene prioridad
+
+    # ── Últimos 5 mensajes ───────────────────────────────────────────────────
+    lineas_historial: list[str] = []
+    if historial:
+        for msg in historial[-5:]:
+            rol = "Cliente" if msg["role"] == "user" else "Sofía"
+            texto = msg["content"]
+            resumen = texto[:120] + ("…" if len(texto) > 120 else "")
+            lineas_historial.append(f"  {rol}: {resumen}")
+
+    # ── Armar bloque ─────────────────────────────────────────────────────────
+    lineas = [
+        f"Lead #{lead_id} — {nombre}",
+        f"Etapa: {etapa}",
+    ]
+
+    if datos:
+        lineas.append("Datos calificadores registrados:")
+        for k, v in datos.items():
+            lineas.append(f"  {k}: {v}")
+    else:
+        lineas.append("Datos calificadores: ninguno registrado aún")
+
+    if lineas_historial:
+        lineas.append("Últimos mensajes:")
+        lineas.extend(lineas_historial)
+    else:
+        lineas.append("Últimos mensajes: inicio de conversación")
+
+    return "\n".join(lineas)
 
 
 async def procesar_mensaje_kommo(
@@ -111,35 +269,24 @@ async def procesar_mensaje_kommo(
         logger.info(f"[BRAIN] Lead {lead_id} en etapa congelada ({etapa}) — silenciado")
         return None
 
-    # ── Construir system prompt enriquecido ──────────────────────────────────
+    # ── Inyectar contexto del lead en el system prompt ───────────────────────
     base_prompt = cargar_system_prompt()
-    if lead_data:
-        contexto_lead = construir_contexto_lead(lead_data)
-        system_prompt = f"{base_prompt}\n\n{contexto_lead}"
-    else:
-        system_prompt = base_prompt
+    contexto = (
+        construir_contexto_lead(lead_data, historial)
+        if lead_data
+        else "Lead nuevo — sin datos registrados aún"
+    )
+    system_prompt = base_prompt.replace("{{contexto_del_lead}}", contexto)
 
-    # ── Llamar a Groq ─────────────────────────────────────────────────────────
-    mensajes = [{"role": "system", "content": system_prompt}]
+    # ── Construir mensajes y ejecutar con tool loop ───────────────────────────
+    mensajes: list[dict] = [{"role": "system", "content": system_prompt}]
     for msg in historial:
         mensajes.append({"role": msg["role"], "content": msg["content"]})
     mensajes.append({"role": "user", "content": texto})
 
-    try:
-        response = await client.chat.completions.create(
-            model=MODELO,
-            messages=mensajes,
-            max_tokens=1024,
-            temperature=0.7,
-        )
-        respuesta = response.choices[0].message.content
-        logger.info(
-            f"[BRAIN] Lead {lead_id} → {len(respuesta)} chars | {response.usage.total_tokens} tokens"
-        )
-        return respuesta
-    except Exception as e:
-        logger.error(f"[BRAIN] Error Groq (lead {lead_id}): {e}")
-        return obtener_mensaje_error()
+    respuesta = await _loop_tools(mensajes, lead_id)
+    logger.info(f"[BRAIN] Lead {lead_id} → {len(respuesta)} chars")
+    return respuesta
 
 
 async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
@@ -156,28 +303,16 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> str:
     if not mensaje or len(mensaje.strip()) < 2:
         return obtener_mensaje_fallback()
 
-    system_prompt = cargar_system_prompt()
+    system_prompt = cargar_system_prompt().replace(
+        "{{contexto_del_lead}}",
+        "Sin contexto CRM — conversación directa",
+    )
 
-    # Groq usa el formato OpenAI: system + historial + mensaje actual
-    mensajes = [{"role": "system", "content": system_prompt}]
-
+    mensajes: list[dict] = [{"role": "system", "content": system_prompt}]
     for msg in historial:
         mensajes.append({"role": msg["role"], "content": msg["content"]})
-
     mensajes.append({"role": "user", "content": mensaje})
 
-    try:
-        response = await client.chat.completions.create(
-            model=MODELO,
-            messages=mensajes,
-            max_tokens=1024,
-            temperature=0.7,
-        )
-
-        respuesta = response.choices[0].message.content
-        logger.info(f"Respuesta generada ({len(respuesta)} chars | {response.usage.total_tokens} tokens)")
-        return respuesta
-
-    except Exception as e:
-        logger.error(f"Error Groq API: {e}")
-        return obtener_mensaje_error()
+    respuesta = await _loop_tools(mensajes, lead_id=None)
+    logger.info(f"[BRAIN] Whapi → {len(respuesta)} chars")
+    return respuesta
