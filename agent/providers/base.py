@@ -7,11 +7,20 @@ from fastapi import Request
 
 @dataclass
 class MensajeEntrante:
-    """Mensaje normalizado — mismo formato sin importar el proveedor."""
-    telefono: str
+    """
+    Mensaje normalizado — mismo formato sin importar el proveedor.
+
+    En modo Whapi:  telefono = número E.164 del remitente.
+    En modo Kommo:  telefono = str(lead_id) — el lead_id es la clave
+                    conversacional maestra; el número real se ignora porque
+                    Kommo ya sabe a qué canal enviar.
+    """
+    telefono: str        # Clave conversacional (número o str(lead_id))
     texto: str
     mensaje_id: str
     es_propio: bool
+    lead_id: int | None = None      # Solo en modo Kommo
+    contact_id: int | None = None   # Solo en modo Kommo
 
 
 class ProveedorWhatsApp(ABC):

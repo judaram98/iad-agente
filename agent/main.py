@@ -29,6 +29,7 @@ from agent.tools import (
 from agent.kommo_sync import sincronizar_con_kommo
 from config.etapas import es_etapa_congelada
 from services.queue import enqueue, iniciar_worker, detener_worker
+from agent.providers.kommo import parsear_form_kommo, ProveedorKommo
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
@@ -230,79 +231,18 @@ async def webhook_handler(request: Request):
 
 
 # ── Webhooks de Kommo ─────────────────────────────────────────────────────────
-
-def _to_int(v) -> int | None:
-    try:
-        return int(v) if v is not None else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_kommo_form(body: bytes) -> dict:
-    """
-    Parsea el payload URL-encoded de Kommo (application/x-www-form-urlencoded).
-
-    Kommo NO envía JSON — envía form-data con notación de brackets:
-      message[add][0][text]=Hola
-      leads[status][0][status_id]=105360847
-
-    Retorna un dict normalizado con 'messages' y 'leads'.
-    """
-    from urllib.parse import parse_qsl
-    flat = dict(parse_qsl(body.decode("utf-8", errors="replace"), keep_blank_values=True))
-
-    # ── Mensajes (message[add][N][...]) ──────────────────────────────────────
-    messages = []
-    i = 0
-    while f"message[add][{i}][id]" in flat:
-        messages.append({
-            "id":          flat.get(f"message[add][{i}][id]"),
-            "entity_id":   _to_int(flat.get(f"message[add][{i}][entity_id]")),   # lead_id
-            "talk_id":     _to_int(flat.get(f"message[add][{i}][talk_id]")),
-            "contact_id":  _to_int(flat.get(f"message[add][{i}][contact_id]")),
-            "text":        flat.get(f"message[add][{i}][text]", ""),
-            "type":        flat.get(f"message[add][{i}][type]", ""),  # incoming | outgoing
-            "origin":      flat.get(f"message[add][{i}][origin]", ""),
-            "author_name": flat.get(f"message[add][{i}][author][name]", ""),
-            "author_type": flat.get(f"message[add][{i}][author][type]", ""),
-            "created_at":  _to_int(flat.get(f"message[add][{i}][created_at]")),
-        })
-        i += 1
-
-    # ── Cambios de etapa (leads[status][N][...]) ──────────────────────────────
-    lead_events = []
-    for prefix in ("status", "add", "update"):
-        i = 0
-        while f"leads[{prefix}][{i}][id]" in flat:
-            lead_events.append({
-                "event":               prefix,
-                "id":                  _to_int(flat.get(f"leads[{prefix}][{i}][id]")),
-                "status_id":           _to_int(flat.get(f"leads[{prefix}][{i}][status_id]")),
-                "old_status_id":       _to_int(flat.get(f"leads[{prefix}][{i}][old_status_id]")),
-                "pipeline_id":         _to_int(flat.get(f"leads[{prefix}][{i}][pipeline_id]")),
-                "responsible_user_id": _to_int(flat.get(f"leads[{prefix}][{i}][responsible_user_id]")),
-            })
-            i += 1
-
-    return {
-        "account_id": _to_int(flat.get("account[id]")),
-        "subdomain":  flat.get("account[subdomain]", ""),
-        "messages":   messages,
-        "leads":      lead_events,
-    }
-
+# El parsing de form-data vive en agent/providers/kommo.py (parsear_form_kommo).
+# main.py solo valida el secret, delega al provider y encola.
 
 def _validar_secret_kommo(request: Request, body_bytes: bytes) -> bool:
     """
-    Acepta el webhook si KOMMO_WEBHOOK_SECRET aparece en:
-      1. Query param  ?secret=...   ← el que usa Kommo (lo pones en la URL)
-      2. Header       X-Kommo-Signature
+    Valida KOMMO_WEBHOOK_SECRET en query param o header.
+    Kommo recomienda embeber el secret en la URL del webhook (?secret=...).
     Sin secret configurado acepta todo (solo útil en dev local).
     """
     secret = settings.KOMMO_WEBHOOK_SECRET
     if not secret:
         return True
-
     if request.query_params.get("secret") == secret:
         return True
     if request.headers.get("X-Kommo-Signature") == secret:
@@ -310,28 +250,52 @@ def _validar_secret_kommo(request: Request, body_bytes: bytes) -> bool:
     return False
 
 
+# Instancia compartida del provider Kommo para los endpoints de webhook.
+# (No depende de AGENT_MODE: los webhooks /webhooks/kommo/* siempre usan Kommo.)
+_kommo_provider = ProveedorKommo()
+
+
 @app.post("/webhooks/kommo/chat")
 async def webhook_kommo_chat(request: Request):
     """
     Recibe mensajes de chat de Kommo (cliente escribió en el Talk).
-    Kommo envía form-data URL-encoded, no JSON.
-    Responde 200 inmediato — Kommo no reintenta.
+    Kommo envía form-data URL-encoded — el provider normaliza a MensajeEntrante.
+    Responde 200 inmediato — Kommo no reintenta si tarda.
     """
     body_bytes = await request.body()
 
     if not _validar_secret_kommo(request, body_bytes):
-        logger.warning("Webhook Kommo /chat rechazado — secret inválido")
+        logger.warning("Kommo /chat rechazado — secret inválido")
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    payload = _parse_kommo_form(body_bytes)
+    # 1. Parsear form-data → dict con 'messages', 'leads'
+    payload = parsear_form_kommo(body_bytes)
 
-    for msg in payload["messages"]:
+    # 2. Normalizar via provider → list[MensajeEntrante]
+    mensajes = _kommo_provider.normalizar_mensajes(payload)
+
+    for msg in mensajes:
         logger.info(
-            f"Kommo /chat | lead={msg['entity_id']} tipo={msg['type']} "
-            f"autor='{msg['author_name']}' texto='{msg['text'][:60]}'"
+            f"Kommo /chat | lead={msg.lead_id} "
+            f"{'[saliente]' if msg.es_propio else '[entrante]'} "
+            f"texto='{msg.texto[:60]}'"
         )
 
-    await enqueue("kommo_chat", payload)
+    # 3. Encolar mensajes normalizados (el worker los procesa con el brain en el siguiente paso)
+    await enqueue("kommo_chat", {
+        "mensajes": [
+            {
+                "telefono":   msg.telefono,
+                "texto":      msg.texto,
+                "mensaje_id": msg.mensaje_id,
+                "es_propio":  msg.es_propio,
+                "lead_id":    msg.lead_id,
+                "contact_id": msg.contact_id,
+            }
+            for msg in mensajes
+        ],
+        "account_id": payload.get("account_id"),
+    })
     return {"status": "ok"}
 
 
@@ -339,16 +303,15 @@ async def webhook_kommo_chat(request: Request):
 async def webhook_kommo_lead(request: Request):
     """
     Recibe cambios de etapa / creación de leads en Kommo.
-    Kommo envía form-data URL-encoded, no JSON.
     Responde 200 inmediato — Kommo no reintenta.
     """
     body_bytes = await request.body()
 
     if not _validar_secret_kommo(request, body_bytes):
-        logger.warning("Webhook Kommo /lead rechazado — secret inválido")
+        logger.warning("Kommo /lead rechazado — secret inválido")
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    payload = _parse_kommo_form(body_bytes)
+    payload = parsear_form_kommo(body_bytes)
 
     for ev in payload["leads"]:
         logger.info(

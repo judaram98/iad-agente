@@ -79,13 +79,13 @@ async def _procesar(item: dict) -> None:
     lag_ms = round((time.monotonic() - item["enqueued_at"]) * 1000)
 
     if tipo == "kommo_chat":
-        for msg in payload.get("messages", []):
+        # payload ya contiene mensajes normalizados (MensajeEntrante serializado)
+        for msg in payload.get("mensajes", []):
             logger.info(
                 "[QUEUE] kommo_chat | "
-                f"lead={msg.get('entity_id')} "
-                f"tipo={msg.get('type')} "
-                f"autor='{msg.get('author_name', '')}' "
-                f"texto='{msg.get('text', '')[:80]}' "
+                f"lead={msg.get('lead_id')} "
+                f"{'[saliente]' if msg.get('es_propio') else '[entrante]'} "
+                f"texto='{msg.get('texto', '')[:80]}' "
                 f"lag={lag_ms}ms"
             )
 
