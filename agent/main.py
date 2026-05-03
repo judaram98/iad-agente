@@ -26,6 +26,7 @@ from agent.tools import (
     CATALOGO_ARCHIVOS, obtener_url_archivo,
 )
 from agent.kommo_sync import sincronizar_con_kommo
+from config.etapas import es_etapa_congelada
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
@@ -75,6 +76,30 @@ async def enviar_archivos(telefono: str, claves: list[str]):
                 logger.info(f"Imagen '{img['ruta_media']}' enviada a {telefono}: {ok}")
 
 
+async def _lead_congelado_en_kommo(telefono: str) -> bool:
+    """
+    Retorna True si el lead del teléfono está en una etapa congelada en Kommo.
+    Retorna False si Kommo no está configurado, el lead no existe, o la llamada falla.
+    """
+    if not settings.KOMMO_PIPELINE_ID:
+        return False
+    try:
+        from services.kommo import searchContactsByPhone, getLead, KommoError
+        contactos = await searchContactsByPhone(telefono)
+        if not contactos:
+            return False
+        for ref in contactos[0].get("_embedded", {}).get("leads", []):
+            try:
+                ld = await getLead(ref["id"])
+                if ld.get("pipeline_id") == settings.KOMMO_PIPELINE_ID:
+                    return es_etapa_congelada(ld.get("status_id", 0))
+            except KommoError:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 async def enviar_seguimientos_programados():
     """Tarea automática: envía seguimientos a leads sin contacto reciente."""
     logger.info("Ejecutando seguimientos automáticos...")
@@ -86,6 +111,10 @@ async def enviar_seguimientos_programados():
 
     for lead in leads:
         try:
+            if await _lead_congelado_en_kommo(lead.telefono):
+                logger.info(f"Seguimiento omitido — {lead.telefono} en etapa congelada en Kommo")
+                continue
+
             mensaje = obtener_mensaje_seguimiento(lead.nombre, lead.seguimientos_enviados)
             enviado = await proveedor.enviar_mensaje(lead.telefono, mensaje)
 

@@ -6,6 +6,10 @@
 
 import logging
 from agent.config import settings
+from config.etapas import (
+    LEADS_ENTRANTES, ETAPAS_CONGELADAS,
+    es_etapa_congelada, etapa_siguiente_por_interes,
+)
 from services.kommo import (
     getLead, moveLeadToStage, setLeadTags,
     searchContactsByPhone, createContact, createLead,
@@ -13,26 +17,6 @@ from services.kommo import (
 )
 
 logger = logging.getLogger("kommo_sync")
-
-# ── IDs de etapas del pipeline "IA" (pipeline_id=13652595) ───────────────────
-
-STAGE_ENTRANTE      = 105360767  # Leads Entrantes
-STAGE_TOQUE1        = 105360771  # IA - Toque 1
-STAGE_SIN_PERFILAR  = 105360863  # IA - Sin perfilar - Contestó
-STAGE_CITA_PRE      = 105360867  # IA - Cita (pre)
-STAGE_CITA_DURANTE  = 105360871  # IA - Cita (durante y post)
-STAGE_FRIOS         = 105360879  # IA - Frios
-STAGE_MAS_ADELANTE  = 105360883  # Más adelante
-
-# Prioridad ordinal para evitar mover un lead hacia atrás en el pipeline.
-# 0 = etapa especial (fríos / más adelante) — sin prioridad comparativa.
-_PRIORIDAD = {
-    STAGE_ENTRANTE:     1,
-    STAGE_TOQUE1:       2,
-    STAGE_SIN_PERFILAR: 3,
-    STAGE_CITA_PRE:     4,
-    STAGE_CITA_DURANTE: 5,
-}
 
 _TAG_INTERES = {
     "alto":    "Interés Alto",
@@ -53,7 +37,7 @@ async def _buscar_lead_en_pipeline(contact_id: int, pipeline_id: int) -> int | N
     for lead_ref in contact.get("_embedded", {}).get("leads", []):
         try:
             lead = await getLead(lead_ref["id"])
-            # Leads cerrados (142 = ganado, 143 = perdido) no se reutilizan
+            # Reutilizar solo leads que no estén cerrados
             if (
                 lead.get("pipeline_id") == pipeline_id
                 and lead.get("status_id") not in (142, 143)
@@ -72,9 +56,10 @@ async def sincronizar_con_kommo(
     """
     Busca o crea el lead del prospecto en Kommo y avanza su etapa según el interés.
 
+    Garantías:
     - Si KOMMO_PIPELINE_ID no está configurado: no-op.
+    - Si el lead está en etapa congelada: no mueve ni retrocede.
     - Si Kommo falla: warning silencioso, retorna None.
-    - Nunca retrocede un lead en el pipeline (excepto → Fríos si interes="ninguno").
 
     Returns: lead_id de Kommo si tuvo éxito, None en caso contrario.
     """
@@ -88,11 +73,11 @@ async def sincronizar_con_kommo(
         contactos = await searchContactsByPhone(telefono)
         if contactos:
             contact_id = contactos[0]["id"]
-            logger.debug(f"Contacto Kommo encontrado: id={contact_id} para {telefono}")
+            logger.debug(f"Contacto Kommo: id={contact_id} ({telefono})")
         else:
-            contacto = await createContact(nombre or telefono, telefono)
+            contacto = await createContact(nombre or _limpiar_telefono(telefono), telefono)
             contact_id = contacto["id"]
-            logger.info(f"Contacto Kommo creado: id={contact_id} para {telefono}")
+            logger.info(f"Contacto Kommo creado: id={contact_id} ({telefono})")
 
         # 2. Buscar lead activo en el pipeline, o crear uno nuevo
         lead_id = await _buscar_lead_en_pipeline(contact_id, pipeline_id)
@@ -102,11 +87,11 @@ async def sincronizar_con_kommo(
             lead = await createLead(
                 name=f"WhatsApp {_limpiar_telefono(telefono)}",
                 pipeline_id=pipeline_id,
-                status_id=STAGE_ENTRANTE,
+                status_id=LEADS_ENTRANTES,
                 contact_id=contact_id,
             )
             lead_id = lead["id"]
-            logger.info(f"Lead Kommo creado: id={lead_id} para {telefono}")
+            logger.info(f"Lead Kommo creado: id={lead_id} ({telefono})")
 
             # Tags iniciales en una sola llamada
             tags = ["IA", "WhatsApp"]
@@ -114,37 +99,31 @@ async def sincronizar_con_kommo(
                 tags.append(_TAG_INTERES[interes])
             await setLeadTags(lead_id, tags)
         else:
-            logger.debug(f"Lead Kommo existente: id={lead_id} para {telefono}")
+            logger.debug(f"Lead Kommo existente: id={lead_id} ({telefono})")
             if interes in _TAG_INTERES:
                 await setLeadTags(lead_id, [_TAG_INTERES[interes]])
 
-        # 3. Mover la etapa según el nivel de interés
+        # 3. Determinar si debemos mover la etapa
         lead_actual = await getLead(lead_id)
         etapa_actual = lead_actual.get("status_id")
-        prioridad_actual = _PRIORIDAD.get(etapa_actual, 0)
 
-        if interes == "ninguno":
-            if etapa_actual != STAGE_FRIOS:
-                await moveLeadToStage(lead_id, STAGE_FRIOS)
-                logger.info(f"Lead {lead_id} → Frios")
+        # Guardia de seguridad: si está congelado, no tocamos nada más
+        if es_etapa_congelada(etapa_actual):
+            logger.debug(f"Lead {lead_id} en etapa congelada ({etapa_actual}) — sin cambios")
+            return lead_id
 
-        elif interes == "alto":
-            if prioridad_actual < _PRIORIDAD[STAGE_CITA_PRE]:
-                await moveLeadToStage(lead_id, STAGE_CITA_PRE)
-                logger.info(f"Lead {lead_id} → Cita (pre)")
-
-        elif es_nuevo or prioridad_actual <= _PRIORIDAD[STAGE_TOQUE1]:
-            # Lead recién creado o todavía en Toque 1 → mover a "Contestó"
-            await moveLeadToStage(lead_id, STAGE_SIN_PERFILAR)
-            logger.info(f"Lead {lead_id} → Sin perfilar / Contestó")
+        etapa_destino = etapa_siguiente_por_interes(interes, etapa_actual)
+        if etapa_destino is not None and etapa_destino != etapa_actual:
+            await moveLeadToStage(lead_id, etapa_destino)
+            logger.info(f"Lead {lead_id}: {etapa_actual} → {etapa_destino} (interés={interes})")
 
         return lead_id
 
     except KommoError as e:
-        logger.warning(f"Kommo sync fallido para {telefono}: {e}")
+        logger.warning(f"Kommo sync fallido ({telefono}): {e}")
         return None
     except Exception as e:
-        logger.error(f"Error inesperado en Kommo sync para {telefono}: {e}")
+        logger.error(f"Error inesperado en Kommo sync ({telefono}): {e}")
         return None
 
 
