@@ -1,14 +1,10 @@
 # agent/tools.py — Herramientas específicas de IAD México
 
-import csv
-import io
 import json
 import logging
 import os
 import unicodedata
 from datetime import datetime
-
-import httpx
 
 logger = logging.getLogger("agentkit")
 
@@ -440,99 +436,14 @@ async def _tool_consultar_inventario(
     tipo: str = None,
     recamaras: int = None,
 ) -> dict:
-    from agent.config import settings
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(settings.INVENTORY_SHEET_CSV_URL)
-            r.raise_for_status()
-    except Exception as e:
-        return {"success": False, "error": f"No se pudo obtener el inventario: {e}"}
-
-    reader = csv.DictReader(io.StringIO(r.text))
-    filas = list(reader)
-    if not filas:
-        return {"success": True, "data": [], "total": 0, "mensaje": "Inventario vacío"}
-
-    # Detectar columnas por nombre flexible
-    headers = list(filas[0].keys())
-    col: dict[str, str] = {}
-    for h in headers:
-        hn = _norm_texto(h)
-        if any(k in hn for k in ("zona", "ciudad", "ubic")) and "zona" not in col:
-            col["zona"] = h
-        if any(k in hn for k in ("precio", "costo", "valor", "monto")) and "precio" not in col:
-            col["precio"] = h
-        if any(k in hn for k in ("tipo", "categoria", "clase")) and "tipo" not in col:
-            col["tipo"] = h
-        if any(k in hn for k in ("recamara", "bedroom", "cuarto", "habitacion")) and "recamaras" not in col:
-            col["recamaras"] = h
-        if any(k in hn for k in ("disponib", "status", "estado", "activo")) and "disponible" not in col:
-            col["disponible"] = h
-        if any(k in hn for k in ("nombre", "proyecto", "unidad")) and "nombre" not in col:
-            col["nombre"] = h
-
-    def get(row: dict, key: str) -> str:
-        return row.get(col.get(key, ""), "")
-
-    def to_num(s: str) -> float | None:
-        s = s.replace(",", "").replace("$", "").replace("MXN", "").strip()
-        try:
-            return float(s)
-        except (ValueError, AttributeError):
-            return None
-
-    ESTADOS_NO_DISPONIBLE = {"no", "false", "0", "vendido", "ocupado", "reservado"}
-
-    resultados = []
-    for row in filas:
-        # Disponibilidad
-        disp = _norm_texto(get(row, "disponible"))
-        if disp and disp in ESTADOS_NO_DISPONIBLE:
-            continue
-
-        # Zona
-        if zona:
-            row_zona = _norm_texto(get(row, "zona"))
-            if row_zona and _norm_texto(zona) not in row_zona:
-                continue
-
-        # Precio
-        precio = to_num(get(row, "precio"))
-        if presupuesto_min is not None and precio is not None and precio < presupuesto_min:
-            continue
-        if presupuesto_max is not None and precio is not None and precio > presupuesto_max:
-            continue
-
-        # Tipo
-        if tipo:
-            row_tipo = _norm_texto(get(row, "tipo"))
-            if row_tipo and _norm_texto(tipo) not in row_tipo:
-                continue
-
-        # Recámaras
-        if recamaras is not None:
-            raw = get(row, "recamaras")
-            if raw:
-                try:
-                    if int(float(raw)) != recamaras:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-        resultados.append(dict(row))
-
-    total = len(resultados)
-    return {
-        "success": True,
-        "total": total,
-        "data": resultados[:10],
-        "mensaje": (
-            f"{total} proyecto(s) encontrado(s) con esos criterios"
-            if total else
-            "No hay proyectos disponibles con esos criterios en el inventario actual"
-        ),
-    }
+    from services.inventario import consultar_inventario
+    return await consultar_inventario(
+        zona=zona,
+        presupuesto_min=presupuesto_min,
+        presupuesto_max=presupuesto_max,
+        tipo=tipo,
+        recamaras=recamaras,
+    )
 
 
 async def _tool_clasificar_lead(
