@@ -14,13 +14,19 @@ negocio:
   cliente_minimo_inversion: "$600,000 MXN"
 
 agente:
-  nombre: "Juan Ramirez de IAD México"
-  tono: "profesional-cercano"
+  nombre: "Sofía"
+  tono: "mexicano-coloquial-profesional"
   casos_de_uso:
-    - "Responder preguntas frecuentes sobre el proyecto"
-    - "Calificar y atender leads de inversión"
-    - "Agendar citas o reuniones con asesores"
+    - "Atender y calificar leads de propiedades"
+    - "Consultar inventario disponible"
+    - "Registrar datos calificadores en CRM"
+    - "Agendar citas con asesores humanos"
     - "Seguimiento automatizado a prospectos"
+
+# Placeholders que se inyectan en el system_prompt de prompts.yaml
+template_vars:
+  nombre_inmobiliaria: "IAD México"
+  ciudad: "Puerto Vallarta, Jalisco"
 
 proyecto:
   nombre: "Acuario Vallarta"
