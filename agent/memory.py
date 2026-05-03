@@ -1,20 +1,43 @@
-# agent/memory.py — Memoria de conversaciones y leads con SQLite
+# agent/memory.py — Memoria de conversaciones y leads (SQLite local / PostgreSQL prod)
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Text, DateTime, select, Integer
+from sqlalchemy import String, Text, DateTime, select, Integer, func
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./agentkit.db")
 
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+def _resolver_database_url() -> str:
+    """
+    Lee DATABASE_URL del entorno y ajusta el dialecto para SQLAlchemy async.
+    - postgresql://  →  postgresql+asyncpg://
+    - sqlite://      →  sqlite+aiosqlite://
+    """
+    url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./agentkit.db")
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
+        return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+
+    return url
+
+
+DATABASE_URL = _resolver_database_url()
+ES_POSTGRES = DATABASE_URL.startswith("postgresql")
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    # Pool más robusto para PostgreSQL en producción
+    pool_pre_ping=True,
+    **({"pool_size": 5, "max_overflow": 10} if ES_POSTGRES else {}),
+)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -27,28 +50,43 @@ class Mensaje(Base):
     __tablename__ = "mensajes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telefono: Mapped[str] = mapped_column(String(50), index=True)
-    role: Mapped[str] = mapped_column(String(20))
-    content: Mapped[str] = mapped_column(Text)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    telefono: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # server_default garantiza que Postgres ponga la fecha, no Python
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class Lead(Base):
     """Registro de prospectos para seguimiento."""
     __tablename__ = "leads"
 
-    telefono: Mapped[str] = mapped_column(String(50), primary_key=True)
+    telefono: Mapped[str] = mapped_column(String(50), primary_key=True, nullable=False)
     nombre: Mapped[str] = mapped_column(String(100), nullable=True)
-    estado: Mapped[str] = mapped_column(String(30), default="nuevo")
     # Estados: nuevo | contactado | interesado | calificado | en_proceso | cerrado | descartado
-    ultimo_contacto: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    seguimientos_enviados: Mapped[int] = mapped_column(Integer, default=0)
+    estado: Mapped[str] = mapped_column(String(30), nullable=False, server_default="nuevo")
+    ultimo_contacto: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    seguimientos_enviados: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     notas: Mapped[str] = mapped_column(Text, nullable=True)
-    creado: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    creado: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
+
+# ── API pública — mismos nombres y firmas que antes ──────────────────────────
 
 async def inicializar_db():
-    """Crea las tablas si no existen."""
+    """Crea las tablas si no existen (idempotente)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -60,7 +98,6 @@ async def guardar_mensaje(telefono: str, role: str, content: str):
             telefono=telefono,
             role=role,
             content=content,
-            timestamp=datetime.utcnow(),
         ))
         await session.commit()
 
@@ -90,13 +127,18 @@ async def limpiar_historial(telefono: str):
         await session.commit()
 
 
-# ── Gestión de leads ──────────────────────────────────────────────────────────
-
-async def registrar_o_actualizar_lead(telefono: str, nombre: str = None, estado: str = None, notas: str = None):
+async def registrar_o_actualizar_lead(
+    telefono: str,
+    nombre: str = None,
+    estado: str = None,
+    notas: str = None,
+):
     """Crea un lead nuevo o actualiza el existente."""
     async with async_session() as session:
         result = await session.execute(select(Lead).where(Lead.telefono == telefono))
         lead = result.scalar_one_or_none()
+
+        now = datetime.now(timezone.utc)
 
         if lead is None:
             lead = Lead(
@@ -104,11 +146,11 @@ async def registrar_o_actualizar_lead(telefono: str, nombre: str = None, estado:
                 nombre=nombre,
                 estado=estado or "nuevo",
                 notas=notas,
-                ultimo_contacto=datetime.utcnow(),
+                ultimo_contacto=now,
             )
             session.add(lead)
         else:
-            lead.ultimo_contacto = datetime.utcnow()
+            lead.ultimo_contacto = now
             if nombre:
                 lead.nombre = nombre
             if estado:
@@ -120,9 +162,9 @@ async def registrar_o_actualizar_lead(telefono: str, nombre: str = None, estado:
 
 
 async def obtener_leads_para_seguimiento(dias_sin_contacto: int = 3) -> list[Lead]:
-    """Retorna leads que no han sido contactados en N días y no están cerrados/descartados."""
+    """Retorna leads sin contacto reciente que no están cerrados ni descartados."""
     from datetime import timedelta
-    limite = datetime.utcnow() - timedelta(days=dias_sin_contacto)
+    limite = datetime.now(timezone.utc) - timedelta(days=dias_sin_contacto)
 
     async with async_session() as session:
         query = (
@@ -136,11 +178,11 @@ async def obtener_leads_para_seguimiento(dias_sin_contacto: int = 3) -> list[Lea
 
 
 async def incrementar_seguimiento(telefono: str):
-    """Incrementa el contador de seguimientos enviados y actualiza la fecha."""
+    """Incrementa el contador de seguimientos y actualiza la fecha de último contacto."""
     async with async_session() as session:
         result = await session.execute(select(Lead).where(Lead.telefono == telefono))
         lead = result.scalar_one_or_none()
         if lead:
             lead.seguimientos_enviados += 1
-            lead.ultimo_contacto = datetime.utcnow()
+            lead.ultimo_contacto = datetime.now(timezone.utc)
             await session.commit()
