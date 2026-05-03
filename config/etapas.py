@@ -65,6 +65,27 @@ def es_etapa_congelada(status_id: int) -> bool:
     return status_id in ETAPAS_CONGELADAS
 
 
+# ── Nombre legible de cada etapa ─────────────────────────────────────────────
+
+NOMBRE_ETAPA: Final[dict[int, str]] = {
+    LEADS_ENTRANTES:       "Leads Entrantes",
+    TOQUE_1:               "IA - Toque 1",
+    TOQUE_2:               "IA - Toque 2",
+    TOQUE_3:               "IA - Toque 3",
+    TOQUE_4:               "IA - Toque 4",
+    TOQUE_5:               "IA - Toque 5",
+    SIN_PERFILAR_CONTESTO: "IA - Sin perfilar / Contestó",
+    CITA_PRE:              "IA - Cita (pre)",
+    CITA_DURANTE_POST:     "Cita (durante y post)",
+    APARTADO:              "Apartado",
+    FRIOS:                 "IA - Fríos",
+    MAS_ADELANTE:          "IA - Más adelante",
+    BUSCANDO_DIFERENTE:    "IA - Buscando algo diferente",
+    GANADOS:               "Logrado con éxito",
+    BAJA:                  "Ventas Perdidos",
+}
+
+
 # ── Helpers de clasificación ──────────────────────────────────────────────────
 
 def etapa_siguiente_por_interes(interes: str, etapa_actual: int) -> int | None:

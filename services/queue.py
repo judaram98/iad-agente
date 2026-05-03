@@ -68,36 +68,75 @@ async def _worker() -> None:
 # ── Procesador ────────────────────────────────────────────────────────────────
 
 async def _procesar(item: dict) -> None:
-    """
-    Lógica de procesamiento de cada evento.
-
-    Por ahora loggea el contenido estructurado.
-    Aquí se conectará la respuesta automática vía Kommo (Etapa 4).
-    """
     tipo = item["tipo"]
     payload = item["payload"]
     lag_ms = round((time.monotonic() - item["enqueued_at"]) * 1000)
 
     if tipo == "kommo_chat":
-        # payload ya contiene mensajes normalizados (MensajeEntrante serializado)
-        for msg in payload.get("mensajes", []):
-            logger.info(
-                "[QUEUE] kommo_chat | "
-                f"lead={msg.get('lead_id')} "
-                f"{'[saliente]' if msg.get('es_propio') else '[entrante]'} "
-                f"texto='{msg.get('texto', '')[:80]}' "
-                f"lag={lag_ms}ms"
-            )
+        await _procesar_kommo_chat(payload, lag_ms)
 
     elif tipo == "kommo_lead":
         for ev in payload.get("leads", []):
             logger.info(
                 "[QUEUE] kommo_lead | "
-                f"lead={ev.get('id')} "
-                f"pipeline={ev.get('pipeline_id')} "
+                f"lead={ev.get('id')} pipeline={ev.get('pipeline_id')} "
                 f"{ev.get('old_status_id')} → {ev.get('status_id')} "
                 f"lag={lag_ms}ms"
             )
 
     else:
         logger.warning(f"[QUEUE] tipo desconocido={tipo} | {item}")
+
+
+async def _procesar_kommo_chat(payload: dict, lag_ms: int) -> None:
+    """Pipeline completo para mensajes de chat de Kommo."""
+    from agent.brain import procesar_mensaje_kommo
+    from agent.memory import guardar_mensaje, obtener_historial, registrar_o_actualizar_lead
+    from agent.tools import calificar_interes, estado_desde_interes
+    from agent.kommo_sync import sincronizar_con_kommo
+    from services.kommo import sendChatMessage, KommoError
+
+    for msg in payload.get("mensajes", []):
+        lead_id = msg.get("lead_id")
+        texto = msg.get("texto", "")
+        es_propio = msg.get("es_propio", False)
+        telefono = msg.get("telefono", str(lead_id))  # str(lead_id) en modo Kommo
+
+        if es_propio or not texto:
+            continue
+
+        logger.info(
+            f"[QUEUE] kommo_chat | lead={lead_id} "
+            f"texto='{texto[:80]}' lag={lag_ms}ms"
+        )
+
+        try:
+            historial = await obtener_historial(telefono)
+
+            respuesta = await procesar_mensaje_kommo(lead_id, texto, historial)
+
+            if respuesta is None:
+                # Lead en etapa congelada — silenciar
+                continue
+
+            await guardar_mensaje(telefono, "user", texto)
+            await guardar_mensaje(telefono, "assistant", respuesta)
+
+            interes = calificar_interes(texto)
+            estado = estado_desde_interes(interes)
+            await registrar_o_actualizar_lead(telefono=telefono, estado=estado)
+
+            try:
+                await sendChatMessage(lead_id, respuesta)
+                logger.info(f"[QUEUE] Respuesta enviada a lead {lead_id} | interés: {interes}")
+            except KommoError as e:
+                logger.error(f"[QUEUE] Error enviando respuesta a lead {lead_id}: {e}")
+
+            await sincronizar_con_kommo(
+                telefono=telefono,
+                nombre=None,
+                interes=interes,
+            )
+
+        except Exception as e:
+            logger.error(f"[QUEUE] Error procesando kommo_chat lead={lead_id}: {e}")
