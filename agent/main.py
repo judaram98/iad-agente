@@ -1,5 +1,6 @@
 # agent/main.py — Servidor FastAPI + Webhook + Scheduler de seguimientos
 
+import json as _json
 import os
 import re
 import logging
@@ -27,6 +28,7 @@ from agent.tools import (
 )
 from agent.kommo_sync import sincronizar_con_kommo
 from config.etapas import es_etapa_congelada
+from services.queue import enqueue, iniciar_worker, detener_worker
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
@@ -132,6 +134,8 @@ async def lifespan(app: FastAPI):
     await inicializar_db()
     logger.info("Base de datos inicializada")
 
+    await iniciar_worker()
+
     scheduler.add_job(
         enviar_seguimientos_programados,
         trigger="interval",
@@ -145,6 +149,7 @@ async def lifespan(app: FastAPI):
 
     yield
     scheduler.shutdown()
+    await detener_worker()
 
 
 app = FastAPI(
@@ -222,3 +227,88 @@ async def webhook_handler(request: Request):
     except Exception as e:
         logger.error(f"Error en webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Webhooks de Kommo ─────────────────────────────────────────────────────────
+
+def _validar_secret_kommo(request: Request, body_bytes: bytes) -> bool:
+    """
+    Acepta el webhook si el KOMMO_WEBHOOK_SECRET aparece en:
+      1. Query param  ?secret=...
+      2. Header       X-Kommo-Signature
+      3. Campo JSON   { "secret": "..." }
+
+    Kommo recomienda pasar el secret como query param en la URL del webhook.
+    """
+    secret = settings.KOMMO_WEBHOOK_SECRET
+    if not secret:
+        return True  # sin secret configurado: aceptar todo (solo útil en dev)
+
+    if request.query_params.get("secret") == secret:
+        return True
+    if request.headers.get("X-Kommo-Signature") == secret:
+        return True
+    try:
+        if _json.loads(body_bytes).get("secret") == secret:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+@app.post("/webhooks/kommo/chat")
+async def webhook_kommo_chat(request: Request):
+    """
+    Recibe mensajes de chat de Kommo (cliente escribió en el Talk).
+
+    Responde 200 de inmediato — Kommo no reintenta si tardamos.
+    El procesamiento real se delega a la cola interna.
+    """
+    body_bytes = await request.body()
+
+    if not _validar_secret_kommo(request, body_bytes):
+        logger.warning("Webhook Kommo /chat rechazado — secret inválido")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        payload = _json.loads(body_bytes)
+    except _json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    msg = payload.get("message", {})
+    logger.info(
+        f"Kommo /chat | lead={msg.get('entity_id')} "
+        f"tipo={msg.get('type')} ts={payload.get('time')}"
+    )
+
+    await enqueue("kommo_chat", payload)
+    return {"status": "ok"}
+
+
+@app.post("/webhooks/kommo/lead")
+async def webhook_kommo_lead(request: Request):
+    """
+    Recibe eventos de cambio de etapa o creación de leads en Kommo.
+
+    Responde 200 de inmediato y encola el procesamiento.
+    """
+    body_bytes = await request.body()
+
+    if not _validar_secret_kommo(request, body_bytes):
+        logger.warning("Webhook Kommo /lead rechazado — secret inválido")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        payload = _json.loads(body_bytes)
+    except _json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    leads = payload.get("leads", {})
+    logger.info(
+        f"Kommo /lead | account={payload.get('account_id')} "
+        f"add={len(leads.get('add', []))} "
+        f"update={len(leads.get('update', []) + leads.get('status', []))}"
+    )
+
+    await enqueue("kommo_lead", payload)
+    return {"status": "ok"}
