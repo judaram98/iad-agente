@@ -371,6 +371,60 @@ Construido con [Claude Code](https://claude.ai/claude-code) para builders de LAT
 
 ---
 
+## Variables de Entorno
+
+Copia `.env.example` → `.env` y llena los valores reales. El servidor falla al
+arrancar con un mensaje claro si alguna variable requerida falta.
+
+```bash
+cp .env.example .env
+```
+
+### Requeridas (el servidor no arranca sin ellas)
+
+| Variable | Formato | Dónde obtenerla |
+|----------|---------|-----------------|
+| `GROQ_API_KEY` | `gsk_...` | [console.groq.com](https://console.groq.com) → API Keys |
+| `KOMMO_SUBDOMAIN` | `miempresa.kommo.com` | URL de tu cuenta Kommo (sin `https://`) |
+| `KOMMO_ACCESS_TOKEN` | `eyJ0eXAiOi...` (JWT) | Kommo → Settings → Integrations → oAuth → long-lived token |
+| `KOMMO_WEBHOOK_SECRET` | cadena aleatoria | `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `INVENTORY_SHEET_CSV_URL` | URL de Google Sheets | Google Sheets → Archivo → Publicar en web → CSV → copiar URL |
+
+### Opcionales / con valor por defecto
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Modelo de Groq. Alternativa rápida: `llama-3.1-8b-instant` |
+| `KOMMO_PIPELINE_ID` | _(vacío)_ | ID numérico del pipeline de Kommo (se configura en Etapa 2) |
+| `AGENT_MODE` | `kommo` | Modo del agente: `kommo` \| `whapi` |
+| `WHAPI_TOKEN` | _(vacío)_ | Token de Whapi.cloud — solo requerido si `AGENT_MODE=whapi` |
+| `WHATSAPP_PROVIDER` | `whapi` | Proveedor de WhatsApp: `whapi` \| `meta` \| `twilio` |
+| `DATABASE_URL` | SQLite local | `sqlite+aiosqlite:///./agentkit.db` (local) o URL de PostgreSQL (prod) |
+| `BASE_URL` | `http://localhost:8000` | URL pública del servidor (Railway la asigna automáticamente) |
+| `PORT` | `8000` | Puerto del servidor |
+| `ENVIRONMENT` | `development` | `development` \| `production` |
+| `FOLLOWUP_DIAS` | `3` | Días sin contacto antes de enviar seguimiento automático al lead |
+
+### PostgreSQL en desarrollo local
+
+Si quieres usar PostgreSQL localmente en lugar de SQLite:
+
+```bash
+docker run -d \
+  --name agentkit-pg \
+  -e POSTGRES_PASSWORD=local \
+  -e POSTGRES_DB=agentkit \
+  -p 5432:5432 \
+  postgres:16-alpine
+```
+
+Luego en `.env`:
+```
+DATABASE_URL=postgresql://postgres:local@localhost:5432/agentkit
+```
+
+---
+
 ## Licencia
 
 MIT — Usa este proyecto como quieras, para lo que quieras.

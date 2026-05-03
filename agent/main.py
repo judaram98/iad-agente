@@ -10,6 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+load_dotenv()
+
+# Forzar la carga y validación de variables de entorno al arranque
+from agent.config import settings
+
 from agent.brain import generar_respuesta
 from agent.memory import (
     inicializar_db, guardar_mensaje, obtener_historial,
@@ -20,8 +25,6 @@ from agent.tools import (
     calificar_interes, estado_desde_interes, obtener_mensaje_seguimiento,
     CATALOGO_ARCHIVOS, obtener_url_archivo,
 )
-
-load_dotenv()
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
