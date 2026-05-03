@@ -25,6 +25,7 @@ from agent.tools import (
     calificar_interes, estado_desde_interes, obtener_mensaje_seguimiento,
     CATALOGO_ARCHIVOS, obtener_url_archivo,
 )
+from agent.kommo_sync import sincronizar_con_kommo
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 log_level = logging.DEBUG if ENVIRONMENT == "development" else logging.INFO
@@ -166,13 +167,20 @@ async def webhook_handler(request: Request):
             await guardar_mensaje(msg.telefono, "user", msg.texto)
             await guardar_mensaje(msg.telefono, "assistant", respuesta_texto)
 
-            # Registrar/actualizar lead
+            # Registrar/actualizar lead en BD local
             interes = calificar_interes(msg.texto)
             estado = estado_desde_interes(interes)
             await registrar_o_actualizar_lead(telefono=msg.telefono, estado=estado)
 
             # Enviar respuesta de texto
             await proveedor.enviar_mensaje(msg.telefono, respuesta_texto)
+
+            # Sincronizar con Kommo CRM (no bloquea si falla)
+            await sincronizar_con_kommo(
+                telefono=msg.telefono,
+                nombre=None,
+                interes=interes,
+            )
 
             # Enviar archivos si el agente los solicitó
             if archivos_a_enviar:
