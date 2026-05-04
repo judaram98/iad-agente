@@ -384,8 +384,17 @@ async def procesar_mensaje_kommo(
         logger.warning(f"[BRAIN] No se pudo obtener lead {lead_id}: {e} — respondiendo sin contexto")
         lead_data = {}
 
-    # ── GUARDIA CRÍTICA: etapa congelada ─────────────────────────────────────
+    # ── GUARDIA 1: pipeline incorrecto — no tocar ni responder ──────────────
+    from agent.config import settings as _settings
     from config.etapas import NOMBRE_ETAPA
+    if _settings.KOMMO_PIPELINE_ID and lead_data.get("pipeline_id") != _settings.KOMMO_PIPELINE_ID:
+        logger.info(
+            f"[BRAIN] Lead {lead_id} pertenece a pipeline "
+            f"{lead_data.get('pipeline_id')} ≠ {_settings.KOMMO_PIPELINE_ID} — ignorado"
+        )
+        return None
+
+    # ── GUARDIA 2: etapa congelada ───────────────────────────────────────────
     status_id = lead_data.get("status_id", 0)
     etapa_nombre = NOMBRE_ETAPA.get(status_id, f"id={status_id}")
     logger.info(f"[brain] cargando contexto del lead={lead_id}, etapa={etapa_nombre}")

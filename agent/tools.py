@@ -446,6 +446,26 @@ async def _tool_consultar_inventario(
     )
 
 
+async def _verificar_lead_en_pipeline(lead_id: int) -> bool:
+    """Verifica que el lead pertenezca al pipeline configurado antes de modificarlo."""
+    from agent.config import settings as _s
+    from services.kommo import getLead, KommoError
+    if not _s.KOMMO_PIPELINE_ID:
+        return True  # sin restricción configurada
+    try:
+        lead = await getLead(lead_id)
+        if lead.get("pipeline_id") != _s.KOMMO_PIPELINE_ID:
+            import logging
+            logging.getLogger("agentkit").warning(
+                f"[tools] lead_id={lead_id} pipeline={lead.get('pipeline_id')} "
+                f"≠ {_s.KOMMO_PIPELINE_ID} — operación bloqueada"
+            )
+            return False
+        return True
+    except KommoError:
+        return False
+
+
 async def _tool_clasificar_lead(
     lead_id: int | None,
     urgencia: str,
@@ -456,6 +476,8 @@ async def _tool_clasificar_lead(
 ) -> dict:
     if lead_id is None:
         return {"success": False, "error": "clasificar_lead solo está disponible en modo Kommo (lead_id requerido)"}
+    if not await _verificar_lead_en_pipeline(lead_id):
+        return {"success": False, "error": "Lead fuera del pipeline configurado — operación ignorada"}
 
     from services.kommo import moveLeadToStage, setLeadTags, KommoError
     from config.etapas import (
@@ -567,6 +589,8 @@ async def _tool_agendar_cita(
 ) -> dict:
     if lead_id is None:
         return {"success": False, "error": "agendar_cita solo está disponible en modo Kommo"}
+    if not await _verificar_lead_en_pipeline(lead_id):
+        return {"success": False, "error": "Lead fuera del pipeline configurado — operación ignorada"}
 
     from services.kommo import setLeadTags, updateLead, KommoError
 
@@ -599,6 +623,8 @@ async def _tool_escalar_a_humano(
 ) -> dict:
     if lead_id is None:
         return {"success": False, "error": "escalar_a_humano solo está disponible en modo Kommo"}
+    if not await _verificar_lead_en_pipeline(lead_id):
+        return {"success": False, "error": "Lead fuera del pipeline configurado — operación ignorada"}
 
     from services.kommo import setLeadTags, KommoError
 
@@ -624,6 +650,8 @@ async def _tool_registrar_dato_calificador(
 ) -> dict:
     if lead_id is None:
         return {"success": False, "error": "registrar_dato_calificador solo está disponible en modo Kommo"}
+    if not await _verificar_lead_en_pipeline(lead_id):
+        return {"success": False, "error": "Lead fuera del pipeline configurado — operación ignorada"}
 
     CAMPOS_VALIDOS = {"presupuesto", "zona", "tipo", "recamaras", "motivo", "urgencia", "forma_pago"}
     if campo not in CAMPOS_VALIDOS:
