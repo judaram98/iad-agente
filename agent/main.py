@@ -1,5 +1,6 @@
 # agent/main.py — Servidor FastAPI + Webhook + Scheduler de seguimientos
 
+import asyncio
 import json as _json
 import os
 import re
@@ -164,9 +165,60 @@ if os.path.exists("media"):
     app.mount("/media", StaticFiles(directory="media"), name="media")
 
 
+def _read_version() -> str:
+    try:
+        with open("VERSION") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "1.0.0"
+
+
+async def _check_db() -> str:
+    from sqlalchemy import text
+    from agent.memory import engine
+    try:
+        async with asyncio.timeout(0.4):
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        return "ok"
+    except Exception:
+        return "down"
+
+
+async def _check_kommo() -> str:
+    import httpx
+    try:
+        async with asyncio.timeout(0.4):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(0.35)) as client:
+                r = await client.get(
+                    f"https://{settings.KOMMO_SUBDOMAIN}/api/v4/account",
+                    headers={"Authorization": f"Bearer {settings.KOMMO_ACCESS_TOKEN}"},
+                )
+                return "ok" if r.status_code == 200 else "down"
+    except Exception:
+        return "down"
+
+
 @app.get("/")
-async def health_check():
+async def root():
     return {"status": "ok", "service": "agentkit-iad-mexico"}
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Liveness + readiness en un solo endpoint.
+    Siempre responde 200 — los campos internos indican el estado real.
+    Garantizado < 500 ms (cada check tiene timeout de 400 ms, se ejecutan en paralelo).
+    """
+    db_status, kommo_status = await asyncio.gather(_check_db(), _check_kommo())
+    return {
+        "status":       "ok",
+        "version":      _read_version(),
+        "agent_mode":   settings.AGENT_MODE,
+        "db_status":    db_status,
+        "kommo_status": kommo_status,
+    }
 
 
 @app.get("/webhook")
