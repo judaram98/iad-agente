@@ -79,6 +79,15 @@ _MAX_TOOL_CALLS = 5
 # incluye como texto plano cuando recibe un 429 y reintenta sin tool_calls.
 _RE_LEAKED_TOOL = re.compile(r"<function=\w+>.*?</function>", re.DOTALL)
 
+# Detecta cuando el modelo anuncia que va a llamar un tool pero no lo llama
+# (finish_reason=stop con texto prometiendo una acción). Forzamos tool_choice=required.
+_RE_TOOL_INTENT = re.compile(
+    r"\b(voy\s+a|vamos\s+a|d[eé]jame|procedo\s+a)\b.{0,80}"
+    r"\b(consultar|revisar|verificar|buscar|checar|obtener)\b"
+    r"|\b(consultar[eé]|revisar[eé]|verificar[eé]|buscar[eé]|obtendr[eé])\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Campos cuyo valor "0" o "0.0" equivale a "no especificado" (placeholder del modelo).
 _CAMPOS_NUMERICOS = frozenset({"presupuesto", "presupuesto_min", "presupuesto_max"})
 _CAMPOS_ENTEROS   = frozenset({"recamaras"})
@@ -167,6 +176,7 @@ async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
         if usar_tools:
             kwargs["tools"] = TOOLS
             kwargs["tool_choice"] = "auto"
+            logger.info(f"[brain] llamando a Groq con {len(TOOLS)} tools disponibles (llamada #{tool_calls_total + 1})")
 
         try:
             response = await client.chat.completions.create(**kwargs)
@@ -177,10 +187,39 @@ async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
         choice = response.choices[0]
         tool_calls = getattr(choice.message, "tool_calls", None)
 
-        # Sin tool calls → retornar texto final (limpiando posibles leaks)
+        # Sin tool calls → verificar si el modelo anunció intención sin llamar (bug de LLaMA)
         if choice.finish_reason != "tool_calls" or not tool_calls:
-            texto = choice.message.content or obtener_mensaje_error()
-            return _limpiar_texto_respuesta(texto)
+            texto = (choice.message.content or "").strip()
+
+            # Detectar "voy a consultar…" / "déjame revisar…" sin llamada real.
+            # Solo en la primera iteración y cuando hay tools disponibles.
+            if usar_tools and tool_calls_total == 0 and texto and _RE_TOOL_INTENT.search(texto):
+                logger.warning(
+                    f"[BRAIN] Modelo anunció herramienta sin llamarla "
+                    f"(finish={choice.finish_reason!r}) — forzando tool_choice=required"
+                )
+                try:
+                    resp2 = await client.chat.completions.create(
+                        model=MODELO,
+                        messages=mensajes,
+                        max_tokens=512,
+                        temperature=0.3,
+                        tools=TOOLS,
+                        tool_choice="required",
+                    )
+                    c2 = resp2.choices[0]
+                    tc2 = getattr(c2.message, "tool_calls", None)
+                    if c2.finish_reason == "tool_calls" and tc2:
+                        logger.info("[BRAIN] Tool call forzado exitoso")
+                        choice, tool_calls = c2, tc2
+                        # Continuar: no hacer return, caer al bloque de procesamiento
+                    else:
+                        return _limpiar_texto_respuesta(texto or obtener_mensaje_error())
+                except Exception as e:
+                    logger.error(f"[BRAIN] Error en tool call forzado: {e}")
+                    return _limpiar_texto_respuesta(texto or obtener_mensaje_error())
+            else:
+                return _limpiar_texto_respuesta(texto or obtener_mensaje_error())
 
         # Si ya alcanzamos el límite y el modelo aún quiere llamar tools,
         # hacer una última llamada sin tools para forzar respuesta de texto.
@@ -335,11 +374,13 @@ async def procesar_mensaje_kommo(
         lead_data = {}
 
     # ── GUARDIA CRÍTICA: etapa congelada ─────────────────────────────────────
+    from config.etapas import NOMBRE_ETAPA
     status_id = lead_data.get("status_id", 0)
+    etapa_nombre = NOMBRE_ETAPA.get(status_id, f"id={status_id}")
+    logger.info(f"[brain] cargando contexto del lead={lead_id}, etapa={etapa_nombre}")
+
     if status_id and es_etapa_congelada(status_id):
-        from config.etapas import NOMBRE_ETAPA
-        etapa = NOMBRE_ETAPA.get(status_id, str(status_id))
-        logger.info(f"[BRAIN] Lead {lead_id} en etapa congelada ({etapa}) — silenciado")
+        logger.info(f"[BRAIN] Lead {lead_id} en etapa congelada ({etapa_nombre}) — silenciado")
         return None
 
     # ── Inyectar contexto del lead en el system prompt ───────────────────────

@@ -105,10 +105,7 @@ async def _procesar_kommo_chat(payload: dict, lag_ms: int) -> None:
         if es_propio or not texto:
             continue
 
-        logger.info(
-            f"[QUEUE] kommo_chat | lead={lead_id} "
-            f"texto='{texto[:80]}' lag={lag_ms}ms"
-        )
+        logger.info(f"[worker] procesando mensaje lead_id={lead_id} text='{texto[:80]}' lag={lag_ms}ms")
 
         try:
             historial = await obtener_historial(telefono)
@@ -128,9 +125,9 @@ async def _procesar_kommo_chat(payload: dict, lag_ms: int) -> None:
 
             try:
                 await sendChatMessage(lead_id, respuesta)
-                logger.info(f"[QUEUE] Respuesta enviada a lead {lead_id} | interés: {interes}")
+                logger.info(f"[kommo] sendChatMessage lead_id={lead_id} → ok | interés: {interes}")
             except KommoError as e:
-                logger.error(f"[QUEUE] Error enviando respuesta a lead {lead_id}: {e}")
+                logger.error(f"[kommo] sendChatMessage lead_id={lead_id} → ERROR: {e}")
 
             await sincronizar_con_kommo(
                 telefono=telefono,

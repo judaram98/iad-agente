@@ -4,6 +4,7 @@ import asyncio
 import json as _json
 import os
 import re
+import time
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
@@ -163,6 +164,16 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def latency_middleware(request: Request, call_next):
+    t0 = time.monotonic()
+    response = await call_next(request)
+    ms = round((time.monotonic() - t0) * 1000)
+    logger.info(f"{request.method} {request.url.path} {response.status_code} (latency={ms}ms)")
+    return response
+
 
 # Servir archivos de media públicamente
 if os.path.exists("media"):
@@ -330,12 +341,12 @@ async def webhook_kommo_chat(request: Request):
     # 2. Normalizar via provider → list[MensajeEntrante]
     mensajes = _kommo_provider.normalizar_mensajes(payload)
 
-    for msg in mensajes:
-        logger.info(
-            f"Kommo /chat | lead={msg.lead_id} "
-            f"{'[saliente]' if msg.es_propio else '[entrante]'} "
-            f"texto='{msg.texto[:60]}'"
-        )
+    entrantes = [m for m in mensajes if not m.es_propio and m.texto]
+    if not entrantes:
+        return {"status": "ok"}  # solo salientes o vacíos — ignorar sin encolar
+
+    lead_ids = [m.lead_id for m in entrantes]
+    logger.info(f"[webhook_chat] secret OK, encolando {len(entrantes)} msg(s) lead_id={lead_ids}")
 
     # 3. Encolar mensajes normalizados (el worker los procesa con el brain en el siguiente paso)
     await enqueue("kommo_chat", {
