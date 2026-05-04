@@ -181,7 +181,18 @@ async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
         try:
             response = await client.chat.completions.create(**kwargs)
         except Exception as e:
-            logger.error(f"[BRAIN] Error Groq API: {e}")
+            err_str = str(e)
+            if "429" in err_str:
+                if "tokens per day" in err_str.lower() or "TPD" in err_str:
+                    logger.error(
+                        f"[BRAIN] Groq 429 TPD — cuota diaria agotada, sin recuperación: {e}"
+                    )
+                else:
+                    logger.warning(
+                        f"[BRAIN] Groq 429 TPM — límite por minuto, reintento posible: {e}"
+                    )
+            else:
+                logger.error(f"[BRAIN] Error Groq API: {e}")
             return obtener_mensaje_error()
 
         choice = response.choices[0]

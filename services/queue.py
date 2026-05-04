@@ -127,7 +127,14 @@ async def _procesar_kommo_chat(payload: dict, lag_ms: int) -> None:
                 await sendChatMessage(lead_id, respuesta)
                 logger.info(f"[kommo] sendChatMessage lead_id={lead_id} → ok | interés: {interes}")
             except KommoError as e:
-                logger.error(f"[kommo] sendChatMessage lead_id={lead_id} → ERROR: {e}")
+                err_str = str(e)
+                if "no tiene conversación" in err_str or "talk" in err_str.lower():
+                    logger.warning(
+                        f"[kommo] lead_id={lead_id} sin talk activo — "
+                        "el cliente no inició conversación en el canal WhatsApp de Kommo"
+                    )
+                else:
+                    logger.error(f"[kommo] sendChatMessage lead_id={lead_id} → ERROR: {e}")
 
             await sincronizar_con_kommo(
                 telefono=telefono,

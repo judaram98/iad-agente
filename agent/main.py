@@ -249,7 +249,13 @@ async def webhook_handler(request: Request):
     """
     Recibe mensajes de WhatsApp, genera respuesta con IA y la envía.
     Si la respuesta incluye [ARCHIVO:xxx], envía el archivo correspondiente.
+
+    En modo Kommo los mensajes llegan por /webhooks/kommo/chat — este endpoint
+    no hace nada para evitar procesamiento duplicado y latencia innecesaria.
     """
+    if settings.AGENT_MODE == "kommo":
+        return {"status": "ok"}
+
     try:
         mensajes = await proveedor.parsear_webhook(request)
 

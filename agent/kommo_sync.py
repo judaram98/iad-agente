@@ -34,14 +34,49 @@ async def _buscar_lead_en_pipeline(contact_id: int, pipeline_id: int) -> int | N
     except KommoError:
         return None
 
+    leads_ref = contact.get("_embedded", {}).get("leads", [])
+    logger.debug(
+        f"_buscar_lead: contact_id={contact_id} buscando pipeline_id={pipeline_id} "
+        f"total_leads_en_contacto={len(leads_ref)}"
+    )
+
+    for lead_ref in leads_ref:
+        try:
+            lead = await getLead(lead_ref["id"])
+            lp = lead.get("pipeline_id")
+            ls = lead.get("status_id")
+            logger.debug(
+                f"_buscar_lead: lead_id={lead_ref['id']} pipeline={lp} status={ls} "
+                f"match={'SÍ' if lp == pipeline_id else 'NO'}"
+            )
+            # Reutilizar solo leads que no estén cerrados
+            if lp == pipeline_id and ls not in (142, 143):
+                return lead["id"]
+        except KommoError:
+            continue
+    return None
+
+
+async def _buscar_cualquier_lead(contact_id: int) -> int | None:
+    """
+    Fallback sin filtro de pipeline: retorna el primer lead activo del contacto.
+    Usado cuando createLead devuelve 400 porque el lead ya existe, posiblemente
+    en un pipeline diferente al configurado en KOMMO_PIPELINE_ID.
+    """
+    from services.kommo import getContact
+    try:
+        contact = await getContact(contact_id)
+    except KommoError:
+        return None
+
     for lead_ref in contact.get("_embedded", {}).get("leads", []):
         try:
             lead = await getLead(lead_ref["id"])
-            # Reutilizar solo leads que no estén cerrados
-            if (
-                lead.get("pipeline_id") == pipeline_id
-                and lead.get("status_id") not in (142, 143)
-            ):
+            if lead.get("status_id") not in (142, 143):
+                logger.debug(
+                    f"_buscar_cualquier_lead: contact_id={contact_id} "
+                    f"lead_id={lead_ref['id']} pipeline={lead.get('pipeline_id')}"
+                )
                 return lead["id"]
         except KommoError:
             continue
@@ -96,19 +131,36 @@ async def sincronizar_con_kommo(
             es_nuevo = lead_id is None
 
             if es_nuevo:
-                lead = await createLead(
-                    name=f"WhatsApp {_limpiar_telefono(telefono)}",
-                    pipeline_id=pipeline_id,
-                    status_id=LEADS_ENTRANTES,
-                    contact_id=contact_id,
-                )
-                lead_id = lead["id"]
-                logger.info(f"Lead Kommo creado: id={lead_id} ({telefono})")
+                try:
+                    lead = await createLead(
+                        name=f"WhatsApp {_limpiar_telefono(telefono)}",
+                        pipeline_id=pipeline_id,
+                        status_id=LEADS_ENTRANTES,
+                        contact_id=contact_id,
+                    )
+                    lead_id = lead["id"]
+                    logger.info(f"Lead Kommo creado: id={lead_id} ({telefono})")
+                except KommoError as e:
+                    if "400" in str(e):
+                        logger.warning(
+                            f"createLead 400 ({telefono}) — posible lead duplicado, "
+                            f"reintentando búsqueda: {e}"
+                        )
+                        # Kommo rechaza crear un segundo lead para el mismo contacto
+                        # en el mismo pipeline — buscar con parámetros relajados
+                        lead_id = await _buscar_cualquier_lead(contact_id)
+                        if lead_id is None:
+                            logger.error(f"createLead 400 y no se encontró lead alternativo ({telefono})")
+                            return None
+                        logger.info(f"Lead Kommo recuperado tras 400: id={lead_id} ({telefono})")
+                    else:
+                        raise
 
-                tags = ["IA", "WhatsApp"]
-                if interes in _TAG_INTERES:
-                    tags.append(_TAG_INTERES[interes])
-                await setLeadTags(lead_id, tags)
+                if es_nuevo and lead_id is not None:
+                    tags = ["IA", "WhatsApp"]
+                    if interes in _TAG_INTERES:
+                        tags.append(_TAG_INTERES[interes])
+                    await setLeadTags(lead_id, tags)
             else:
                 logger.debug(f"Lead Kommo existente: id={lead_id} ({telefono})")
                 if interes in _TAG_INTERES:
