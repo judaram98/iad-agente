@@ -133,8 +133,12 @@ async def enviar_seguimientos_programados():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from agent.db import DATABASE_URL
+    # Loggear el dialecto sin exponer credenciales
+    db_dialecto = DATABASE_URL.split("://")[0] if "://" in DATABASE_URL else DATABASE_URL
+    logger.info(f"[DB] Conectando con dialecto: {db_dialecto}")
+
     await inicializar_db()
-    logger.info("Base de datos inicializada")
 
     await iniciar_worker()
 
@@ -175,7 +179,7 @@ def _read_version() -> str:
 
 async def _check_db() -> str:
     from sqlalchemy import text
-    from agent.memory import engine
+    from agent.db import engine
     try:
         async with asyncio.timeout(0.4):
             async with engine.connect() as conn:

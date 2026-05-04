@@ -1,48 +1,14 @@
 # agent/memory.py — Memoria de conversaciones y leads (SQLite local / PostgreSQL prod)
 
-import os
+import logging
 from datetime import datetime, timezone
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import String, Text, DateTime, select, Integer, func
-from dotenv import load_dotenv
 
-load_dotenv()
+from agent.db import Base, engine, async_session
 
-
-def _resolver_database_url() -> str:
-    """
-    Lee DATABASE_URL del entorno y ajusta el dialecto para SQLAlchemy async.
-    - postgresql://  →  postgresql+asyncpg://
-    - sqlite://      →  sqlite+aiosqlite://
-    """
-    url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./agentkit.db")
-
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
-    if url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
-        return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
-
-    return url
-
-
-DATABASE_URL = _resolver_database_url()
-ES_POSTGRES = DATABASE_URL.startswith("postgresql")
-
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    # Pool más robusto para PostgreSQL en producción
-    pool_pre_ping=True,
-    **({"pool_size": 5, "max_overflow": 10} if ES_POSTGRES else {}),
-)
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-
-class Base(DeclarativeBase):
-    pass
+logger = logging.getLogger("agentkit")
 
 
 class Mensaje(Base):
@@ -86,9 +52,20 @@ class Lead(Base):
 # ── API pública — mismos nombres y firmas que antes ──────────────────────────
 
 async def inicializar_db():
-    """Crea las tablas si no existen (idempotente)."""
+    """
+    Crea las tablas si no existen (idempotente).
+
+    IMPORTANTE: importa todos los módulos con modelos ANTES de create_all
+    para que SQLAlchemy los tenga registrados en Base.metadata.
+    Si añades modelos en nuevos archivos, agrégalos aquí.
+    """
+    import agent.memory  # noqa: Mensaje, Lead → registrados en Base.metadata
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    tablas = sorted(Base.metadata.tables.keys())
+    logger.info(f"[DB] {len(tablas)} tabla(s) listas: {tablas}")
 
 
 async def guardar_mensaje(telefono: str, role: str, content: str):
