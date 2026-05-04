@@ -24,7 +24,9 @@
       "Read(//usr/local/bin/**)",
       "Bash(.venv/bin/pip install *)",
       "Bash(.venv/bin/python -c ' *)",
-      "Bash(.venv/bin/python *)"
+      "Bash(.venv/bin/python *)",
+      "WebFetch(domain:docs.google.com)",
+      "WebFetch(domain:doc-08-9c-sheets.googleusercontent.com)"
     ]
   }
 }

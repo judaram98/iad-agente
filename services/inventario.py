@@ -37,9 +37,9 @@ _COL_ALIASES: dict[str, tuple[str, ...]] = {
     "precio":      ("precio", "costo", "valor", "monto", "importe", "inversion", "venta"),
     "tipo":        ("tipo", "categoria", "clase", "tipologia", "producto"),
     "recamaras":   ("recamara", "bedroom", "cuarto", "habitacion", "rec"),
-    "disponible":  ("disponib", "status", "estado", "activo", "disponibilidad"),
+    "disponible":  ("disponib", "status", "disponibilidad"),  # "activo" eliminado — demasiado genérico
     "m2":          ("m2", "metros", "superficie", "area", "tamano"),
-    "descripcion": ("descripcion", "descripcion", "detalle", "notas", "observacion", "comentario"),
+    "descripcion": ("descripcion", "detalle", "notas", "observacion", "comentario"),
 }
 
 _ESTADOS_NO_DISPONIBLE = frozenset({
@@ -79,19 +79,21 @@ def _limpiar_header(s: str) -> str:
     """
     Normaliza un header para comparación:
     - Minúsculas, sin tildes (_norm)
+    - Guiones bajos y guiones → espacio (tipo_producto → "tipo producto")
     - Sin puntuación ("Rec." → "rec", "M²" → "m2")
     - "²"/"³" → "2"/"3" para manejar notación de metros cuadrados
+    - Espacios múltiples colapsados
     """
     s = _norm(s)
     chars = []
     for c in s:
         if c.isalpha():
             chars.append(c)
-        elif c.isdigit() or c == "²":
+        elif c.isdigit() or c in ("²", "³"):
             chars.append("2" if c == "²" else "3" if c == "³" else c)
-        elif c == " ":
-            chars.append(c)
-    return "".join(chars).strip()
+        elif c in (" ", "_", "-"):    # separadores → espacio
+            chars.append(" ")
+    return " ".join("".join(chars).split())  # colapsa espacios múltiples
 
 
 def _detectar_columnas(headers: list[str]) -> dict[str, str]:
@@ -155,16 +157,56 @@ def _normalizar_fila(raw: dict, col: dict[str, str]) -> dict:
 
 # ── Fetch y parseo ────────────────────────────────────────────────────────────
 
+def _corregir_url_sheets(url: str) -> str:
+    """
+    Convierte una URL de Google Sheets en formato de edición o visualización
+    a la URL de exportación CSV que devuelve datos parseable.
+
+    /edit?...  →  /export?format=csv
+    /view?...  →  /export?format=csv
+    /pub?...   →  /export?format=csv  (si pub?output=csv ya era correcto lo deja)
+    """
+    import re as _re
+    m = _re.search(r"/spreadsheets/d/([^/]+)", url)
+    if not m:
+        return url  # no parece un sheet — dejar pasar y fallar descriptivamente
+
+    sheet_id = m.group(1)
+    # Extraer gid (pestaña) si está presente
+    gid_m = _re.search(r"[?&]gid=(\d+)", url)
+    gid_param = f"&gid={gid_m.group(1)}" if gid_m else ""
+
+    if "/edit" in url or "/view" in url or ("/pub" in url and "output=csv" not in url):
+        nueva = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_param}"
+        logger.warning(
+            f"[INVENTARIO] URL de edición detectada — corregida automáticamente a exportación CSV.\n"
+            f"  Actualiza INVENTORY_SHEET_CSV_URL en .env:\n  {nueva}"
+        )
+        return nueva
+
+    return url
+
+
 async def _fetch_y_normalizar() -> list[dict]:
     """Descarga el CSV, lo parsea y retorna filas normalizadas."""
     from agent.config import settings
 
-    url = settings.INVENTORY_SHEET_CSV_URL
-    logger.info(f"[INVENTARIO] Descargando CSV desde Google Sheets…")
+    url = _corregir_url_sheets(settings.INVENTORY_SHEET_CSV_URL)
+    logger.info(f"[INVENTARIO] Descargando CSV…")
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         r = await client.get(url)
         r.raise_for_status()
+
+    # Guardia: Google devuelve HTML si la URL es incorrecta o el sheet es privado
+    content_type = r.headers.get("content-type", "")
+    if "text/html" in content_type:
+        primeros = r.text[:200].replace("\n", " ")
+        raise ValueError(
+            f"El servidor devolvió HTML en vez de CSV (content-type: {content_type}).\n"
+            f"  Verifica que el Sheet sea público ('Cualquiera con el enlace puede ver').\n"
+            f"  Primeros 200 chars: {primeros}"
+        )
 
     reader = csv.DictReader(io.StringIO(r.text))
     raw_filas = list(reader)
@@ -173,8 +215,13 @@ async def _fetch_y_normalizar() -> list[dict]:
         logger.warning("[INVENTARIO] CSV vacío")
         return []
 
-    col = _detectar_columnas(list(raw_filas[0].keys()))
-    logger.info(f"[INVENTARIO] {len(raw_filas)} filas cargadas | columnas detectadas: {list(col.keys())}")
+    headers = list(raw_filas[0].keys())
+    col = _detectar_columnas(headers)
+    logger.info(
+        f"[INVENTARIO] {len(raw_filas)} filas | "
+        f"headers CSV: {headers[:8]}{'…' if len(headers) > 8 else ''} | "
+        f"columnas mapeadas: {col}"
+    )
 
     return [_normalizar_fila(r, col) for r in raw_filas]
 
