@@ -136,6 +136,7 @@ async def _procesar_kommo_chat(payload: dict, lag_ms: int) -> None:
                 telefono=telefono,
                 nombre=None,
                 interes=interes,
+                lead_id=lead_id,
             )
 
         except Exception as e:

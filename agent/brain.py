@@ -75,6 +75,73 @@ def obtener_mensaje_fallback() -> str:
 
 _MAX_TOOL_CALLS = 5
 
+# Regex para eliminar tags <function=...>...</function> que LLaMA 3 a veces
+# incluye como texto plano cuando recibe un 429 y reintenta sin tool_calls.
+_RE_LEAKED_TOOL = re.compile(r"<function=\w+>.*?</function>", re.DOTALL)
+
+# Campos cuyo valor "0" o "0.0" equivale a "no especificado" (placeholder del modelo).
+_CAMPOS_NUMERICOS = frozenset({"presupuesto", "presupuesto_min", "presupuesto_max"})
+_CAMPOS_ENTEROS   = frozenset({"recamaras"})
+
+
+def _limpiar_args(raw_arguments: str) -> tuple[dict, str]:
+    """
+    Parsea y limpia los argumentos de un tool call.
+
+    Groq rechaza historial con valores `null` o tipos incorrectos en campos
+    opcionales — esto causa un HTTP 400 en la llamada SIGUIENTE al tool call.
+
+    Eliminamos:
+    - null / None
+    - strings vacíos
+    - "0" / "0.0" como placeholder numérico del modelo
+
+    Convertimos:
+    - strings numéricas ("550000") → float/int según el campo
+    """
+    try:
+        raw = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return {}, "{}"
+
+    clean: dict = {}
+    for k, v in raw.items():
+        if v is None:
+            continue
+        if isinstance(v, str):
+            v = v.strip()
+            if not v or v.lower() in ("0", "0.0", "null", "none"):
+                continue
+            if k in _CAMPOS_NUMERICOS:
+                try:
+                    v = float(v.replace(",", "").replace("$", "").replace(" ", ""))
+                    if v == 0.0:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            elif k in _CAMPOS_ENTEROS:
+                try:
+                    v = int(float(v))
+                    if v == 0:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+        elif isinstance(v, (int, float)) and v == 0 and k in (_CAMPOS_NUMERICOS | _CAMPOS_ENTEROS):
+            continue
+        clean[k] = v
+
+    return clean, json.dumps(clean, ensure_ascii=False)
+
+
+def _limpiar_texto_respuesta(texto: str) -> str:
+    """
+    Elimina fragmentos <function=...>...</function> que el modelo incluye
+    como texto plano cuando Groq reintenta tras un 429 y el finish_reason
+    es 'stop' en vez de 'tool_calls'.
+    """
+    limpio = _RE_LEAKED_TOOL.sub("", texto).strip()
+    return re.sub(r"\n{3,}", "\n\n", limpio)
+
 
 async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
     """
@@ -110,9 +177,10 @@ async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
         choice = response.choices[0]
         tool_calls = getattr(choice.message, "tool_calls", None)
 
-        # Sin tool calls → retornar texto final
+        # Sin tool calls → retornar texto final (limpiando posibles leaks)
         if choice.finish_reason != "tool_calls" or not tool_calls:
-            return choice.message.content or obtener_mensaje_error()
+            texto = choice.message.content or obtener_mensaje_error()
+            return _limpiar_texto_respuesta(texto)
 
         # Si ya alcanzamos el límite y el modelo aún quiere llamar tools,
         # hacer una última llamada sin tools para forzar respuesta de texto.
@@ -122,35 +190,40 @@ async def _loop_tools(mensajes: list[dict], lead_id: int | None) -> str:
                 final = await client.chat.completions.create(
                     model=MODELO, messages=mensajes, max_tokens=1024, temperature=0.7,
                 )
-                return final.choices[0].message.content or obtener_mensaje_error()
+                texto = final.choices[0].message.content or obtener_mensaje_error()
+                return _limpiar_texto_respuesta(texto)
             except Exception as e:
                 logger.error(f"[BRAIN] Error en llamada final sin tools: {e}")
                 return obtener_mensaje_error()
 
-        # Agregar mensaje del asistente (con sus tool calls) al historial
+        # Agregar mensaje del asistente al historial con args LIMPIOS.
+        # Groq valida el historial completo en cada llamada — args con null/tipos
+        # incorrectos en mensajes anteriores causan HTTP 400 en la siguiente llamada.
+        tool_calls_limpios = []
+        args_por_id: dict[str, dict] = {}
+
+        for tc in tool_calls:
+            args_clean, args_str = _limpiar_args(tc.function.arguments)
+            args_por_id[tc.id] = args_clean
+            tool_calls_limpios.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": args_str,   # sin nulls
+                },
+            })
+
         mensajes.append({
             "role": "assistant",
-            "content": choice.message.content,  # puede ser None — OK para OpenAI/Groq
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ],
+            "content": choice.message.content,
+            "tool_calls": tool_calls_limpios,
         })
 
-        # Ejecutar cada tool call y agregar el resultado
+        # Ejecutar cada tool call con los args ya limpios
         for tc in tool_calls:
             tool_calls_total += 1
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
+            args = args_por_id[tc.id]
 
             logger.info(f"[BRAIN] Tool call #{tool_calls_total}: {tc.function.name}({list(args.keys())})")
             result_str = await ejecutar_tool(tc.function.name, args, lead_id)

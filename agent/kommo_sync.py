@@ -52,9 +52,14 @@ async def sincronizar_con_kommo(
     telefono: str,
     nombre: str | None,
     interes: str,
+    lead_id: int | None = None,
 ) -> int | None:
     """
     Busca o crea el lead del prospecto en Kommo y avanza su etapa según el interés.
+
+    Si `lead_id` se provee (modo Kommo), omite la búsqueda por teléfono y trabaja
+    directamente sobre ese lead — evita el 400 de Kommo que ocurre cuando
+    str(lead_id) se trata como número de teléfono y genera un lead duplicado.
 
     Garantías:
     - Si KOMMO_PIPELINE_ID no está configurado: no-op.
@@ -69,45 +74,50 @@ async def sincronizar_con_kommo(
     pipeline_id = settings.KOMMO_PIPELINE_ID
 
     try:
-        # 1. Buscar o crear contacto
-        contactos = await searchContactsByPhone(telefono)
-        if contactos:
-            contact_id = contactos[0]["id"]
-            logger.debug(f"Contacto Kommo: id={contact_id} ({telefono})")
-        else:
-            contacto = await createContact(nombre or _limpiar_telefono(telefono), telefono)
-            contact_id = contacto["id"]
-            logger.info(f"Contacto Kommo creado: id={contact_id} ({telefono})")
+        if lead_id is not None:
+            # Modo Kommo: ya conocemos el lead — solo actualizar tags y etapa.
+            logger.debug(f"Kommo sync directo: lead_id={lead_id} interes={interes}")
 
-        # 2. Buscar lead activo en el pipeline, o crear uno nuevo
-        lead_id = await _buscar_lead_en_pipeline(contact_id, pipeline_id)
-        es_nuevo = lead_id is None
-
-        if es_nuevo:
-            lead = await createLead(
-                name=f"WhatsApp {_limpiar_telefono(telefono)}",
-                pipeline_id=pipeline_id,
-                status_id=LEADS_ENTRANTES,
-                contact_id=contact_id,
-            )
-            lead_id = lead["id"]
-            logger.info(f"Lead Kommo creado: id={lead_id} ({telefono})")
-
-            # Tags iniciales en una sola llamada
-            tags = ["IA", "WhatsApp"]
-            if interes in _TAG_INTERES:
-                tags.append(_TAG_INTERES[interes])
-            await setLeadTags(lead_id, tags)
-        else:
-            logger.debug(f"Lead Kommo existente: id={lead_id} ({telefono})")
             if interes in _TAG_INTERES:
                 await setLeadTags(lead_id, [_TAG_INTERES[interes]])
 
-        # 3. Determinar si debemos mover la etapa
+        else:
+            # Modo Whapi: buscar o crear contacto + lead por teléfono.
+            contactos = await searchContactsByPhone(telefono)
+            if contactos:
+                contact_id = contactos[0]["id"]
+                logger.debug(f"Contacto Kommo: id={contact_id} ({telefono})")
+            else:
+                contacto = await createContact(nombre or _limpiar_telefono(telefono), telefono)
+                contact_id = contacto["id"]
+                logger.info(f"Contacto Kommo creado: id={contact_id} ({telefono})")
+
+            lead_id = await _buscar_lead_en_pipeline(contact_id, pipeline_id)
+            es_nuevo = lead_id is None
+
+            if es_nuevo:
+                lead = await createLead(
+                    name=f"WhatsApp {_limpiar_telefono(telefono)}",
+                    pipeline_id=pipeline_id,
+                    status_id=LEADS_ENTRANTES,
+                    contact_id=contact_id,
+                )
+                lead_id = lead["id"]
+                logger.info(f"Lead Kommo creado: id={lead_id} ({telefono})")
+
+                tags = ["IA", "WhatsApp"]
+                if interes in _TAG_INTERES:
+                    tags.append(_TAG_INTERES[interes])
+                await setLeadTags(lead_id, tags)
+            else:
+                logger.debug(f"Lead Kommo existente: id={lead_id} ({telefono})")
+                if interes in _TAG_INTERES:
+                    await setLeadTags(lead_id, [_TAG_INTERES[interes]])
+
+        # Avanzar etapa si corresponde (aplica a ambos modos)
         lead_actual = await getLead(lead_id)
         etapa_actual = lead_actual.get("status_id")
 
-        # Guardia de seguridad: si está congelado, no tocamos nada más
         if es_etapa_congelada(etapa_actual):
             logger.debug(f"Lead {lead_id} en etapa congelada ({etapa_actual}) — sin cambios")
             return lead_id

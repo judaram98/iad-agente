@@ -133,23 +133,23 @@ def _normalizar_fila(raw: dict, col: dict[str, str]) -> dict:
     Convierte una fila del CSV en un dict normalizado con claves consistentes.
     Siempre incluye _raw con la fila original para depuración.
     """
-    precio_raw = raw.get(col.get("precio", ""), "")
-    rec_raw = raw.get(col.get("recamaras", ""), "")
-    disp_raw = _norm(raw.get(col.get("disponible", ""), ""))
+    precio_raw  = (raw.get(col.get("precio", ""))      or "")
+    rec_raw     = (raw.get(col.get("recamaras", ""))   or "")
+    disp_raw    = _norm(raw.get(col.get("disponible", "")) or "")
 
     return {
-        "nombre":      (raw.get(col.get("nombre", ""), "") or "Sin nombre").strip(),
-        "zona":        _norm(raw.get(col.get("zona", ""), "")),
-        "zona_display": raw.get(col.get("zona", ""), "").strip(),
-        "precio":      _to_float(precio_raw),
+        "nombre":       ((raw.get(col.get("nombre", "")) or "") or "Sin nombre").strip(),
+        "zona":         _norm(raw.get(col.get("zona", "")) or ""),
+        "zona_display": (raw.get(col.get("zona", "")) or "").strip(),
+        "precio":       _to_float(precio_raw),
         "precio_display": precio_raw.strip(),
-        "tipo":        _norm(raw.get(col.get("tipo", ""), "")),
-        "tipo_display": raw.get(col.get("tipo", ""), "").strip(),
-        "recamaras":   _to_int(rec_raw),
-        "m2":          raw.get(col.get("m2", ""), "").strip(),
-        "descripcion": raw.get(col.get("descripcion", ""), "").strip(),
-        "disponible":  disp_raw not in _ESTADOS_NO_DISPONIBLE if disp_raw else True,
-        "_raw":        raw,
+        "tipo":         _norm(raw.get(col.get("tipo", "")) or ""),
+        "tipo_display": (raw.get(col.get("tipo", "")) or "").strip(),
+        "recamaras":    _to_int(rec_raw),
+        "m2":           (raw.get(col.get("m2", "")) or "").strip(),
+        "descripcion":  (raw.get(col.get("descripcion", "")) or "").strip(),
+        "disponible":   disp_raw not in _ESTADOS_NO_DISPONIBLE if disp_raw else True,
+        "_raw":         raw,
     }
 
 

@@ -160,6 +160,8 @@ async def _req(
         if r.status_code == 404:
             raise KommoNotFoundError(f"404: recurso no encontrado — {endpoint}")
 
+        if not (200 <= r.status_code < 300):
+            logger.debug(f"Kommo {r.status_code} body: {r.text[:500]}")
         r.raise_for_status()
 
         # 204 No Content (ej: DELETE exitoso)
